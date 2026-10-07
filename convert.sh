@@ -379,6 +379,17 @@ FIX_NET=0
 case "$nans" in y|Y) FIX_NET=1 ;; esac
 
 # --------------------------------------------------------------------------
+REMOVE_AZURE=0
+if ls "$MNT"/boot/vmlinuz-*azure* >/dev/null 2>&1; then
+    step "Bước 8b: Kernel Azure"
+    ls "$MNT"/boot/vmlinuz-*
+    echo "Phát hiện kernel azure (tối ưu cho Hyper-V). Trên KVM/OpenStack nên dùng kernel generic."
+    echo "Nếu chưa có kernel generic, script sẽ cài linux-image-generic trước rồi mới gỡ kernel azure."
+    read -rp "Gỡ kernel azure và dùng kernel generic? (Y/n): " kans
+    case "$kans" in n|N) ;; *) REMOVE_AZURE=1 ;; esac
+fi
+
+# --------------------------------------------------------------------------
 step "Bước 9: Chạy cấu hình trong chroot (cài GRUB UEFI, virtio, fstab)"
 cat > "$MNT/root/fix-uefi-chroot.sh" <<'CHROOT_EOF'
 #!/bin/bash
@@ -386,6 +397,7 @@ set -e
 ESP_UUID="$1"
 FIX_NET="$2"
 ESP_DEV="${3:-}"
+REMOVE_AZURE="${4:-0}"
 export DEBIAN_FRONTEND=noninteractive
 
 # DNS tạm thời
@@ -428,6 +440,41 @@ apt-get update
 apt-get install -y -o Dpkg::Options::=--force-confold \
     grub-efi-amd64 grub-efi-amd64-signed shim-signed efibootmgr
 
+if [ "$REMOVE_AZURE" = "1" ]; then
+    echo "[chroot] Chuyển từ kernel azure sang kernel generic"
+    if ! ls /boot/vmlinuz-*-generic >/dev/null 2>&1; then
+        echo "[chroot] Chưa có kernel generic, cài linux-image-generic"
+        apt-get install -y linux-image-generic
+    fi
+    if ! ls /boot/vmlinuz-*-generic >/dev/null 2>&1; then
+        echo "[chroot] LỖI: không có kernel generic, không gỡ kernel azure."; exit 1
+    fi
+    AZ_PKGS=$(dpkg-query -W -f='${Package} ${db:Status-Abbrev}\n' 2>/dev/null \
+        | awk '$2 ~ /^ii/ && $1 ~ /^linux-/ && $1 ~ /azure/ {print $1}')
+    if [ -n "$AZ_PKGS" ]; then
+        echo "[chroot] Gỡ: $AZ_PKGS"
+        # shellcheck disable=SC2086
+        apt-get purge -y $AZ_PKGS
+    fi
+fi
+
+echo "[chroot] Sửa cấu hình GRUB của image cloud"
+mkdir -p /root/grub-backup
+cp -a /etc/default/grub /root/grub-backup/grub.default 2>/dev/null || true
+cp -a /etc/default/grub.d/. /root/grub-backup/grub.d/ 2>/dev/null || true
+mkdir -p /etc/default/grub.d
+# PARTUUID đã đổi khi chuyển MBR -> GPT: bỏ ép root theo PARTUUID cũ
+rm -f /etc/default/grub.d/40-force-partuuid.cfg
+sed -i -E 's/^(GRUB_FORCE_PARTUUID=)/#\1/' /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null || true
+# Hiện menu, đưa output ra cả màn hình VNC (tty1) và cổng serial
+cat > /etc/default/grub.d/99-cmc-cloud.cfg <<'GRUBEOF'
+GRUB_TIMEOUT=5
+GRUB_TIMEOUT_STYLE=menu
+GRUB_RECORDFAIL_TIMEOUT=5
+GRUB_TERMINAL="console serial"
+GRUB_CMDLINE_LINUX_DEFAULT="console=ttyS0,115200 console=tty1"
+GRUBEOF
+
 echo "[chroot] Thêm driver virtio vào initramfs"
 for m in virtio_blk virtio_scsi virtio_net virtio_pci; do
     grep -qx "$m" /etc/initramfs-tools/modules || echo "$m" >> /etc/initramfs-tools/modules
@@ -435,10 +482,25 @@ done
 update-initramfs -u -k all
 
 echo "[chroot] grub-install"
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck \
-    || echo "[chroot] Cảnh báo: không ghi được entry NVRAM (bình thường trên cloud), dùng bản --removable."
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck
+# --no-nvram: luôn chép đủ file vào ESP, không phụ thuộc việc ghi biến EFI
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --no-nvram --recheck
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-nvram --recheck
+# Thử thêm entry NVRAM nếu live CD boot UEFI (không bắt buộc)
+if [ -d /sys/firmware/efi/efivars ]; then
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu >/dev/null 2>&1 || true
+fi
 update-grub
+
+echo "[chroot] Kiểm tra cấu hình boot"
+if grep -q 'root=PARTUUID=' /boot/grub/grub.cfg; then
+    echo "[chroot] LỖI: grub.cfg vẫn còn root=PARTUUID (sẽ không boot được):"
+    grep -n 'root=PARTUUID=' /boot/grub/grub.cfg | head -3
+    exit 1
+fi
+echo "[chroot] Tham số root trong grub.cfg:"
+grep -o 'root=[^ ]*' /boot/grub/grub.cfg | sort -u | head -3
+echo "[chroot] Kernel còn lại:"
+ls /boot/vmlinuz-*
 
 if [ "$FIX_NET" = "1" ]; then
     echo "[chroot] Ghi đè netplan bằng DHCP chung"
@@ -458,12 +520,16 @@ NETEOF
 fi
 
 echo "[chroot] Kiểm tra file boot UEFI"
-test -f /boot/efi/EFI/BOOT/BOOTX64.EFI
 ls -R /boot/efi/EFI
+for f in /boot/efi/EFI/BOOT/BOOTX64.EFI /boot/efi/EFI/ubuntu/grub.cfg; do
+    if [ ! -f "$f" ]; then
+        echo "[chroot] LỖI: thiếu $f"; exit 1
+    fi
+done
 CHROOT_EOF
 chmod +x "$MNT/root/fix-uefi-chroot.sh"
 
-chroot "$MNT" /bin/bash /root/fix-uefi-chroot.sh "$ESP_UUID" "$FIX_NET" "$ESP_DEV"
+chroot "$MNT" /bin/bash /root/fix-uefi-chroot.sh "$ESP_UUID" "$FIX_NET" "$ESP_DEV" "$REMOVE_AZURE"
 rc=$?
 rm -f "$MNT/root/fix-uefi-chroot.sh"
 [ "$rc" -eq 0 ] || die "Bước trong chroot bị lỗi (mã $rc). Xem thông báo phía trên. Bảng phân vùng đã được đổi sang GPT, ĐỪNG reboot khi chưa sửa xong."
