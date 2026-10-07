@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================================================
-# convert.sh  (v6)
+# convert.sh  (v7)
 # Sửa VM Ubuntu/Debian restore (Acronis, từ Azure/VMware/vật lý...) để boot
 # trên KVM/OpenStack:
 #   - Chuyển MBR sang GPT, tạo ESP + bios_grub
@@ -442,7 +442,7 @@ fi
 
 # --------------------------------------------------------------------------
 step "Bước 9: Chạy cấu hình trong chroot (cài GRUB UEFI, virtio, fstab)"
-cat > "$MNT/root/fix-boot-chroot.sh" <<'CHROOT_EOF'
+cat > "$MNT/root/convert-chroot.sh" <<'CHROOT_EOF'
 #!/bin/bash
 set -e
 ESP_UUID="$1"
@@ -486,6 +486,10 @@ ESP_LINK="/dev/disk/by-uuid/$ESP_UUID"
 echo "[chroot] Đặt debconf grub-efi/install_devices = $ESP_LINK"
 echo "grub-efi-amd64 grub-efi/install_devices multiselect $ESP_LINK" | debconf-set-selections
 echo "grub-efi-amd64 grub-efi/install_devices_empty boolean false" | debconf-set-selections
+# Không ghi entry NVRAM khi gói GRUB UEFI cấu hình/nâng cấp: VM boot BIOS không có biến EFI,
+# và trên cloud NVRAM thường không lưu. Boot UEFI dùng bản --removable (EFI/BOOT/BOOTX64.EFI).
+echo "[chroot] Đặt debconf grub2/update_nvram = false"
+echo "grub-efi-amd64 grub2/update_nvram boolean false" | debconf-set-selections
 
 echo "[chroot] Cài GRUB UEFI"
 dpkg --configure -a || true
@@ -568,6 +572,35 @@ if [ -n "$BIOS_DISK" ]; then
     # grub-pc-bin không xung đột với grub-efi-amd64 (khác với gói grub-pc)
     apt-get install -y grub-pc-bin
     grub-install --target=i386-pc --recheck "$BIOS_DISK"
+
+    echo "[chroot] Cài hook apt tự cài lại GRUB BIOS khi grub-pc-bin được nâng cấp"
+    cat > /usr/local/sbin/grub-bios-reinstall <<'HOOKEOF'
+#!/bin/sh
+# Tạo bởi convert.sh: cài lại GRUB legacy (BIOS) khi gói grub-pc-bin vừa được cập nhật.
+# So sánh nội dung (không so thời gian vì dpkg giữ mtime gốc của gói).
+SRC=/usr/lib/grub/i386-pc/kernel.img
+DST=/boot/grub/i386-pc/kernel.img
+[ -f "$SRC" ] || exit 0
+if [ -f "$DST" ] && cmp -s "$SRC" "$DST"; then
+    exit 0
+fi
+DISK=$(grub-probe -t disk /boot/grub 2>/dev/null | head -n1)
+[ -b "$DISK" ] || DISK="@BIOS_DISK@"
+[ -b "$DISK" ] || { logger -t grub-bios-reinstall "không tìm thấy đĩa để cài GRUB BIOS"; exit 0; }
+if grub-install --target=i386-pc "$DISK" >/dev/null 2>&1; then
+    logger -t grub-bios-reinstall "đã cài lại GRUB BIOS lên $DISK"
+else
+    logger -t grub-bios-reinstall "LỖI cài lại GRUB BIOS lên $DISK"
+    echo "CẢNH BÁO: cài lại GRUB BIOS lỗi, hãy chạy tay: grub-install --target=i386-pc $DISK" >&2
+fi
+exit 0
+HOOKEOF
+    sed -i "s|@BIOS_DISK@|$BIOS_DISK|" /usr/local/sbin/grub-bios-reinstall
+    chmod 755 /usr/local/sbin/grub-bios-reinstall
+    cat > /etc/apt/apt.conf.d/99-grub-bios-reinstall <<'HOOKEOF'
+// Tạo bởi convert.sh: sau mỗi lần dpkg chạy, cài lại GRUB BIOS nếu grub-pc-bin vừa đổi
+DPkg::Post-Invoke { "if [ -x /usr/local/sbin/grub-bios-reinstall ]; then /usr/local/sbin/grub-bios-reinstall; fi"; };
+HOOKEOF
 fi
 update-grub
 
@@ -619,11 +652,11 @@ for f in /boot/efi/EFI/BOOT/BOOTX64.EFI /boot/efi/EFI/ubuntu/grub.cfg; do
     fi
 done
 CHROOT_EOF
-chmod +x "$MNT/root/fix-boot-chroot.sh"
+chmod +x "$MNT/root/convert-chroot.sh"
 
-chroot "$MNT" /bin/bash /root/fix-boot-chroot.sh "$ESP_UUID" "$FIX_NET" "$ESP_DEV" "$REMOVE_AZURE" "$BIOS_DISK" "$IS_AZURE"
+chroot "$MNT" /bin/bash /root/convert-chroot.sh "$ESP_UUID" "$FIX_NET" "$ESP_DEV" "$REMOVE_AZURE" "$BIOS_DISK" "$IS_AZURE"
 rc=$?
-rm -f "$MNT/root/fix-boot-chroot.sh"
+rm -f "$MNT/root/convert-chroot.sh"
 [ "$rc" -eq 0 ] || die "Bước trong chroot bị lỗi (mã $rc). Xem thông báo phía trên. Bảng phân vùng đã được đổi sang GPT, ĐỪNG reboot khi chưa sửa xong."
 
 # --------------------------------------------------------------------------
