@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================================================
-# convert.sh  (v5)
+# convert.sh  (v6)
 # Sửa VM Ubuntu/Debian restore (Acronis, từ Azure/VMware/vật lý...) để boot
 # trên KVM/OpenStack:
 #   - Chuyển MBR sang GPT, tạo ESP + bios_grub
@@ -470,7 +470,7 @@ echo "[chroot] Cập nhật fstab"
 cp -a /etc/fstab "/etc/fstab.bak.$(date +%s)"
 sed -i '\#[[:space:]]/boot/efi[[:space:]]#d' /etc/fstab
 [ -n "$(tail -c1 /etc/fstab)" ] && echo >> /etc/fstab
-echo "UUID=$ESP_UUID  /boot/efi  vfat  umask=0077  0  1" >> /etc/fstab
+echo "UUID=$ESP_UUID  /boot/efi  vfat  umask=0077,nofail  0  1" >> /etc/fstab
 
 # Ubuntu 24.04 có thể có dòng /var/lib/grub/esp trỏ tới /dev/disk/by-id/...-part1 của đĩa cũ.
 # Gói grub-efi-amd64-signed mount dòng này khi cài, nên phải trỏ về ESP mới.
@@ -495,10 +495,9 @@ apt-get install -y -o Dpkg::Options::=--force-confold \
 
 if [ "$REMOVE_AZURE" = "1" ]; then
     echo "[chroot] Chuyển từ kernel azure sang kernel generic"
-    if ! ls /boot/vmlinuz-*-generic >/dev/null 2>&1; then
-        echo "[chroot] Chưa có kernel generic, cài linux-image-generic"
-        apt-get install -y linux-image-generic
-    fi
+    # Luôn cài gói meta linux-generic để kernel generic tiếp tục được cập nhật
+    echo "[chroot] Cài gói meta linux-generic"
+    apt-get install -y linux-generic
     if ! ls /boot/vmlinuz-*-generic >/dev/null 2>&1; then
         echo "[chroot] LỖI: không có kernel generic, không gỡ kernel azure."; exit 1
     fi
@@ -519,14 +518,36 @@ mkdir -p /etc/default/grub.d
 # PARTUUID đã đổi khi chuyển MBR -> GPT: bỏ ép root theo PARTUUID cũ
 rm -f /etc/default/grub.d/40-force-partuuid.cfg
 sed -i -E 's/^(GRUB_FORCE_PARTUUID=)/#\1/' /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null || true
+# Lấy cmdline hiện có (bỏ qua file 99 của script nếu đã chạy trước đó)
+CUR_CMDLINE=$(
+    set +e
+    GRUB_CMDLINE_LINUX_DEFAULT=""
+    [ -f /etc/default/grub ] && . /etc/default/grub >/dev/null 2>&1
+    for f in /etc/default/grub.d/*.cfg; do
+        [ "$f" = /etc/default/grub.d/99-cmc-cloud.cfg ] && continue
+        [ -f "$f" ] && . "$f" >/dev/null 2>&1
+    done
+    printf '%s' "$GRUB_CMDLINE_LINUX_DEFAULT"
+)
+# Giữ nguyên mọi tham số cũ, chỉ bỏ các console= cũ rồi nối console mới vào cuối
+NEW_CMDLINE=$(
+    set -f
+    for t in $CUR_CMDLINE; do
+        case "$t" in console=*) ;; *) printf '%s ' "$t" ;; esac
+    done
+)
+NEW_CMDLINE="${NEW_CMDLINE}console=ttyS0,115200 console=tty1"
+echo "[chroot] Cmdline cũ : ${CUR_CMDLINE:-(trống)}"
+echo "[chroot] Cmdline mới: $NEW_CMDLINE"
 # Hiện menu, đưa output ra cả màn hình VNC (tty1) và cổng serial
-cat > /etc/default/grub.d/99-cmc-cloud.cfg <<'GRUBEOF'
-GRUB_TIMEOUT=5
-GRUB_TIMEOUT_STYLE=menu
-GRUB_RECORDFAIL_TIMEOUT=5
-GRUB_TERMINAL="console serial"
-GRUB_CMDLINE_LINUX_DEFAULT="console=ttyS0,115200 console=tty1"
-GRUBEOF
+{
+    echo "# Tạo bởi convert.sh. Bản gốc: /root/grub-backup/"
+    echo "GRUB_TIMEOUT=5"
+    echo "GRUB_TIMEOUT_STYLE=menu"
+    echo "GRUB_RECORDFAIL_TIMEOUT=5"
+    echo 'GRUB_TERMINAL="console serial"'
+    echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$NEW_CMDLINE\""
+} > /etc/default/grub.d/99-cmc-cloud.cfg
 
 echo "[chroot] Thêm driver virtio vào initramfs"
 for m in virtio_blk virtio_scsi virtio_net virtio_pci; do
