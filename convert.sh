@@ -24,6 +24,7 @@ SHRINK_MIB=540          # dung lượng giải phóng khi cần thu nhỏ (ESP +
 MNT=/mnt
 PROBE=/tmp/probe-root
 ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+BIOSBOOT_GUID="21686148-6449-6e6f-744e-656564454649"
 
 R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'
 info() { echo "${G}[+]${N} $*"; }
@@ -186,8 +187,8 @@ step "Bước 0: Kiểm tra ban đầu"
 if [ -d /sys/firmware/efi ]; then
     info "Live CD đang boot ở chế độ UEFI."
 else
-    warn "Live CD đang boot ở chế độ BIOS. Vẫn làm được, nhưng VM chỉ boot UEFI khi"
-    warn "hạ tầng cấp firmware UEFI cho VM."
+    warn "Live CD đang boot ở chế độ BIOS (SeaBIOS). VM này dùng Legacy BIOS."
+    warn "Script sẽ cài bootloader cho CẢ BIOS và UEFI, nên VM boot được ở cả hai chế độ."
 fi
 
 if lsblk -nrpo MOUNTPOINT "$DISK" | grep -q .; then
@@ -339,6 +340,31 @@ ESP_UUID=$(blkid -s UUID -o value "$ESP_DEV")
 info "ESP: $ESP_DEV  UUID=$ESP_UUID"
 
 # --------------------------------------------------------------------------
+step "Bước 6b: Phân vùng bios_grub (để boot được cả Legacy BIOS)"
+BIOS_DISK=""
+BIOSBOOT_DEV=$(lsblk -nrpo PATH,PARTTYPE "$DISK" 2>/dev/null \
+    | awk -v g="$BIOSBOOT_GUID" 'tolower($2)==g {print $1}' | head -n1)
+if [ -n "$BIOSBOOT_DEV" ]; then
+    info "Đã có bios_grub: $BIOSBOOT_DEV"
+    BIOS_DISK="$DISK"
+else
+    MIN_START=$(lsblk -nrpo PATH,TYPE "$DISK" | awk '$2=="part"{print $1}' \
+        | while read -r p; do part_start "$p"; done | sort -n | head -n1)
+    if [ -n "$MIN_START" ] && [ "$MIN_START" -ge 2048 ]; then
+        if sgdisk -a 1 -n 0:34:2047 -t 0:ef02 -c 0:"BIOS boot" "$DISK"; then
+            partprobe "$DISK" 2>/dev/null; udevadm settle; sleep 1
+            info "Đã tạo bios_grub ở sector 34-2047"
+            BIOS_DISK="$DISK"
+        else
+            warn "Không tạo được bios_grub. VM sẽ CHỈ boot được bằng UEFI."
+        fi
+    else
+        warn "Phân vùng đầu bắt đầu ở sector ${MIN_START:-?} (< 2048), không có chỗ cho bios_grub."
+        warn "VM sẽ CHỈ boot được bằng UEFI."
+    fi
+fi
+
+# --------------------------------------------------------------------------
 step "Bước 7: Mount hệ thống"
 vgchange -ay >/dev/null 2>&1
 mkdir -p "$MNT"
@@ -398,6 +424,7 @@ ESP_UUID="$1"
 FIX_NET="$2"
 ESP_DEV="${3:-}"
 REMOVE_AZURE="${4:-0}"
+BIOS_DISK="${5:-}"
 export DEBIAN_FRONTEND=noninteractive
 
 # DNS tạm thời
@@ -489,6 +516,12 @@ grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-nvra
 if [ -d /sys/firmware/efi/efivars ]; then
     grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu >/dev/null 2>&1 || true
 fi
+if [ -n "$BIOS_DISK" ]; then
+    echo "[chroot] Cài thêm GRUB legacy (BIOS) lên $BIOS_DISK"
+    # grub-pc-bin không xung đột với grub-efi-amd64 (khác với gói grub-pc)
+    apt-get install -y grub-pc-bin
+    grub-install --target=i386-pc --recheck "$BIOS_DISK"
+fi
 update-grub
 
 echo "[chroot] Kiểm tra cấu hình boot"
@@ -529,7 +562,7 @@ done
 CHROOT_EOF
 chmod +x "$MNT/root/fix-uefi-chroot.sh"
 
-chroot "$MNT" /bin/bash /root/fix-uefi-chroot.sh "$ESP_UUID" "$FIX_NET" "$ESP_DEV" "$REMOVE_AZURE"
+chroot "$MNT" /bin/bash /root/fix-uefi-chroot.sh "$ESP_UUID" "$FIX_NET" "$ESP_DEV" "$REMOVE_AZURE" "$BIOS_DISK"
 rc=$?
 rm -f "$MNT/root/fix-uefi-chroot.sh"
 [ "$rc" -eq 0 ] || die "Bước trong chroot bị lỗi (mã $rc). Xem thông báo phía trên. Bảng phân vùng đã được đổi sang GPT, ĐỪNG reboot khi chưa sửa xong."
@@ -544,7 +577,12 @@ echo
 echo "${G}${B}HOÀN TẤT.${N}"
 echo "Việc còn lại:"
 echo "  1. Tháo ISO Ubuntu live khỏi instance."
-echo "  2. Đảm bảo VM chạy firmware UEFI (hw_firmware_type=uefi), rồi: reboot"
+if [ -n "$BIOS_DISK" ]; then
+    echo "  2. Reboot. Đĩa boot được cả Legacy BIOS (SeaBIOS) lẫn UEFI."
+    echo "     Sau mỗi lần nâng cấp gói GRUB, nên chạy: sudo grub-install --target=i386-pc $BIOS_DISK"
+else
+    echo "  2. Đĩa CHỈ boot được UEFI: VM phải chạy firmware UEFI (hw_firmware_type=uefi), rồi reboot."
+fi
 echo "  3. Sau khi boot, kiểm tra:"
 echo "       [ -d /sys/firmware/efi ] && echo UEFI || echo BIOS"
 echo "       lsblk -f"
