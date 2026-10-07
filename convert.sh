@@ -1,16 +1,21 @@
 #!/bin/bash
 # ==========================================================================
-# convert-to-uefi.sh  (v2)
-# Chuyển hệ thống Ubuntu/Debian từ MBR (legacy) sang GPT + ESP để boot UEFI.
+# fix-boot-kvm.sh  (v3)
+# Sửa VM Ubuntu/Debian restore (Acronis, từ Azure/VMware/vật lý...) để boot
+# trên KVM/OpenStack:
+#   - Chuyển MBR sang GPT, tạo ESP + bios_grub
+#   - Cài GRUB cho CẢ Legacy BIOS (SeaBIOS) lẫn UEFI
+#   - Thêm driver virtio, sửa cấu hình GRUB của image cloud
+#   - Sửa mạng (netplan) và tắt dịch vụ Hyper-V/Azure nếu có
 # Hỗ trợ: root là ext2/3/4 trên phân vùng thường, hoặc trên LVM.
 # Chạy trong Ubuntu Desktop Live (có mạng), bằng quyền root:
 #
-#     sudo bash convert-to-uefi.sh            # mặc định ổ /dev/vda
-#     sudo bash convert-to-uefi.sh /dev/sda   # chỉ định ổ khác
+#     sudo bash fix-boot-kvm.sh            # mặc định ổ /dev/vda
+#     sudo bash fix-boot-kvm.sh /dev/sda   # chỉ định ổ khác
 #
 # Biến môi trường tùy chọn:
 #     ROOT_DEV=/dev/vda1   bỏ qua bước tự dò phân vùng root
-#                          (chạy: sudo ROOT_DEV=... bash convert-to-uefi.sh)
+#                          (chạy: sudo ROOT_DEV=... bash fix-boot-kvm.sh)
 #
 # Khi đĩa không còn chỗ trống cho ESP, script đề nghị tự thu nhỏ phân vùng
 # cuối (chỉ khi đó là ext2/3/4 hoặc PV của LVM), có hỏi xác nhận.
@@ -397,12 +402,32 @@ step "Bước 8: Cấu hình mạng (netplan)"
 echo "Cấu hình netplan hiện tại:"
 cat "$MNT"/etc/netplan/*.yaml 2>/dev/null || echo "(không có file netplan)"
 echo
-echo "Nếu máy gốc dùng tên card mạng cố định (ens160, eth0...), VM mới có thể mất mạng/SSH."
-echo "Ghi đè bằng cấu hình DHCP chung sẽ khắc phục (file cũ được backup vào /root/netplan-backup)."
-echo "${Y}Đừng chọn y nếu máy dùng IP tĩnh.${N}"
-read -rp "Ghi đè netplan bằng DHCP chung? (y/N): " nans
+NET_DEFAULT=N
+if cat "$MNT"/etc/netplan/*.yaml 2>/dev/null | grep -Eq 'hv_netvsc|macaddress:|set-name:'; then
+    warn "Netplan đang khớp theo driver Hyper-V / MAC cũ / tên card cố định (kiểu Azure)."
+    warn "Trên KVM card mạng là virtio với MAC mới nên sẽ KHÔNG có mạng. Khuyên chọn Y."
+    NET_DEFAULT=Y
+fi
+if cat "$MNT"/etc/netplan/*.yaml 2>/dev/null | grep -Eq '^[[:space:]]*addresses:'; then
+    warn "Netplan có IP tĩnh (addresses:). Nếu chọn Y, máy sẽ chuyển sang DHCP."
+    NET_DEFAULT=N
+fi
+echo "Ghi đè bằng cấu hình DHCP chung (khớp mọi card e*), file cũ backup vào /root/netplan-backup,"
+echo "đồng thời tắt cloud-init quản lý mạng để không bị ghi đè lại."
+read -rp "Ghi đè netplan bằng DHCP chung? (Y/N, mặc định $NET_DEFAULT): " nans
+[ -z "$nans" ] && nans="$NET_DEFAULT"
 FIX_NET=0
 case "$nans" in y|Y) FIX_NET=1 ;; esac
+
+# Phát hiện image Azure / Hyper-V
+IS_AZURE=0
+if ls "$MNT"/boot/vmlinuz-*azure* >/dev/null 2>&1 \
+   || [ -d "$MNT/var/lib/waagent" ] \
+   || [ -e "$MNT/lib/systemd/system/walinuxagent.service" ] \
+   || ls "$MNT"/lib/systemd/system/hv-kvp-daemon.service >/dev/null 2>&1; then
+    IS_AZURE=1
+    info "Phát hiện thành phần Azure/Hyper-V: sẽ tắt hv-kvp/hv-vss/hv-fcopy và walinuxagent."
+fi
 
 # --------------------------------------------------------------------------
 REMOVE_AZURE=0
@@ -417,7 +442,7 @@ fi
 
 # --------------------------------------------------------------------------
 step "Bước 9: Chạy cấu hình trong chroot (cài GRUB UEFI, virtio, fstab)"
-cat > "$MNT/root/fix-uefi-chroot.sh" <<'CHROOT_EOF'
+cat > "$MNT/root/fix-boot-chroot.sh" <<'CHROOT_EOF'
 #!/bin/bash
 set -e
 ESP_UUID="$1"
@@ -425,6 +450,7 @@ FIX_NET="$2"
 ESP_DEV="${3:-}"
 REMOVE_AZURE="${4:-0}"
 BIOS_DISK="${5:-}"
+IS_AZURE="${6:-0}"
 export DEBIAN_FRONTEND=noninteractive
 
 # DNS tạm thời
@@ -550,6 +576,18 @@ network:
       dhcp4: true
 NETEOF
     chmod 600 /etc/netplan/01-generic-dhcp.yaml
+    if [ -d /etc/cloud/cloud.cfg.d ]; then
+        echo "[chroot] Tắt cloud-init quản lý mạng"
+        echo "network: {config: disabled}" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    fi
+fi
+
+if [ "$IS_AZURE" = "1" ]; then
+    echo "[chroot] Tắt dịch vụ Hyper-V/Azure (không dùng trên KVM)"
+    for svc in hv-kvp-daemon.service hv-vss-daemon.service hv-fcopy-daemon.service; do
+        systemctl mask "$svc" >/dev/null 2>&1 && echo "  mask $svc" || true
+    done
+    systemctl disable walinuxagent.service >/dev/null 2>&1 && echo "  disable walinuxagent.service" || true
 fi
 
 echo "[chroot] Kiểm tra file boot UEFI"
@@ -560,11 +598,11 @@ for f in /boot/efi/EFI/BOOT/BOOTX64.EFI /boot/efi/EFI/ubuntu/grub.cfg; do
     fi
 done
 CHROOT_EOF
-chmod +x "$MNT/root/fix-uefi-chroot.sh"
+chmod +x "$MNT/root/fix-boot-chroot.sh"
 
-chroot "$MNT" /bin/bash /root/fix-uefi-chroot.sh "$ESP_UUID" "$FIX_NET" "$ESP_DEV" "$REMOVE_AZURE" "$BIOS_DISK"
+chroot "$MNT" /bin/bash /root/fix-boot-chroot.sh "$ESP_UUID" "$FIX_NET" "$ESP_DEV" "$REMOVE_AZURE" "$BIOS_DISK" "$IS_AZURE"
 rc=$?
-rm -f "$MNT/root/fix-uefi-chroot.sh"
+rm -f "$MNT/root/fix-boot-chroot.sh"
 [ "$rc" -eq 0 ] || die "Bước trong chroot bị lỗi (mã $rc). Xem thông báo phía trên. Bảng phân vùng đã được đổi sang GPT, ĐỪNG reboot khi chưa sửa xong."
 
 # --------------------------------------------------------------------------
