@@ -1,7 +1,8 @@
 #!/bin/bash
 # ==========================================================================
-# convert-to-uefi.sh
+# convert-to-uefi.sh  (v2)
 # Chuyển hệ thống Ubuntu/Debian từ MBR (legacy) sang GPT + ESP để boot UEFI.
+# Hỗ trợ: root là ext2/3/4 trên phân vùng thường, hoặc trên LVM.
 # Chạy trong Ubuntu Desktop Live (có mạng), bằng quyền root:
 #
 #     sudo bash convert-to-uefi.sh            # mặc định ổ /dev/vda
@@ -9,12 +10,17 @@
 #
 # Biến môi trường tùy chọn:
 #     ROOT_DEV=/dev/vda1   bỏ qua bước tự dò phân vùng root
+#                          (chạy: sudo ROOT_DEV=... bash convert-to-uefi.sh)
+#
+# Khi đĩa không còn chỗ trống cho ESP, script đề nghị tự thu nhỏ phân vùng
+# cuối (chỉ khi đó là ext2/3/4 hoặc PV của LVM), có hỏi xác nhận.
 # ==========================================================================
 set -u
 
 DISK="${1:-/dev/vda}"
 ESP_MAX_MIB=512
 ESP_MIN_MIB=100
+SHRINK_MIB=540          # dung lượng giải phóng khi cần thu nhỏ (ESP + dự phòng GPT)
 MNT=/mnt
 PROBE=/tmp/probe-root
 ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
@@ -34,9 +40,142 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ---------------------------- hàm tiện ích --------------------------------
 list_esp() {
     lsblk -nrpo PATH,PARTTYPE "$DISK" 2>/dev/null \
         | awk -v g="$ESP_GUID" 'tolower($2)==g {print $1}' | sort
+}
+part_start() { cat "/sys/class/block/$(basename "$1")/start" 2>/dev/null; }
+part_num()   { cat "/sys/class/block/$(basename "$1")/partition" 2>/dev/null; }
+part_size()  { blockdev --getsz "$1"; }
+
+# Sector cuối (không tính) lớn nhất của các phân vùng trên đĩa
+disk_last_end() {
+    local m=0 p s z e
+    while read -r p; do
+        s=$(part_start "$p"); z=$(part_size "$p")
+        [ -n "$s" ] && [ -n "$z" ] || continue
+        e=$((s + z))
+        [ "$e" -gt "$m" ] && m=$e
+    done < <(lsblk -nrpo PATH,TYPE "$DISK" | awk '$2=="part"{print $1}')
+    echo "$m"
+}
+
+# Vùng trống liền kề lớn nhất (đơn vị sector)
+largest_free_sectors() {
+    parted -ms "$DISK" unit s print free 2>/dev/null \
+        | awk -F: '$NF=="free;" {v=$4; sub("s","",v); if (v+0>m) m=v+0} END{print m+0}'
+}
+
+# Đổi kích thước phân vùng (giữ nguyên start, type, uuid): $1=phân vùng, $2=số sector mới
+shrink_partition() {
+    local part=$1 newsz=$2 n s t u script
+    n=$(part_num "$part"); s=$(part_start "$part")
+    t=$(sfdisk --part-type "$DISK" "$n" 2>/dev/null)
+    [ -n "$n" ] && [ -n "$s" ] && [ -n "$t" ] || return 1
+    script="start=$s, size=$newsz, type=$t"
+    if [ "$PT" = "gpt" ]; then
+        u=$(sfdisk --part-uuid "$DISK" "$n" 2>/dev/null)
+        [ -n "$u" ] && script="$script, uuid=$u"
+    fi
+    echo "$script" | sfdisk --wipe-partitions never --no-reread -N "$n" "$DISK" >/dev/null || return 1
+    partprobe "$DISK" 2>/dev/null; udevadm settle; sleep 1
+    [ "$(part_size "$part")" -eq "$newsz" ]
+}
+
+# Tự thu nhỏ phân vùng cuối chứa root (ext2/3/4 thường hoặc PV của LVM)
+do_shrink() {
+    local mode target vg parent n s z e last fstype new_sect
+    local bs minblk min_mib fs_mib vg_free need red pv_mib new_pv_mib a
+
+    if lvs "$ROOT_DEV" >/dev/null 2>&1; then
+        mode=lvm
+        vg=$(lvs --noheadings -o vg_name "$ROOT_DEV" | xargs)
+        target=$(pvs --noheadings -o pv_name --select "vg_name=$vg" 2>/dev/null | xargs)
+        if [ "$(wc -w <<<"$target")" -ne 1 ]; then
+            warn "VG $vg có nhiều PV, script không tự thu nhỏ trường hợp này."; return 1
+        fi
+    else
+        mode=std; target="$ROOT_DEV"
+    fi
+
+    parent=$(lsblk -nrpo PKNAME "$target" 2>/dev/null | head -n1)
+    if [ "$(readlink -f "$parent")" != "$(readlink -f "$DISK")" ]; then
+        warn "$target không nằm trên $DISK."; return 1
+    fi
+
+    n=$(part_num "$target"); s=$(part_start "$target"); z=$(part_size "$target"); e=$((s + z))
+    last=$(disk_last_end)
+    if [ "$e" -ne "$last" ]; then
+        warn "$target không phải phân vùng cuối đĩa (có phân vùng khác nằm sau, ví dụ swap)."
+        warn "Script không tự thu nhỏ trường hợp này."; return 1
+    fi
+    if [ "$PT" = "dos" ] && [ "${n:-0}" -gt 4 ]; then
+        warn "$target là phân vùng logical (extended), script không xử lý."; return 1
+    fi
+
+    fstype=$(blkid -s TYPE -o value "$ROOT_DEV")
+    case "$fstype" in
+        ext2|ext3|ext4) ;;
+        *) warn "Root là '$fstype', chỉ tự thu nhỏ được ext2/3/4."; return 1 ;;
+    esac
+
+    new_sect=$(( (z - SHRINK_MIB * 2048) / 2048 * 2048 ))
+    if [ "$new_sect" -le $((2048 * 1024)) ]; then
+        warn "Phân vùng quá nhỏ để thu nhỏ thêm."; return 1
+    fi
+
+    echo
+    echo "${Y}${B}KẾ HOẠCH THU NHỎ${N}"
+    echo "  Kiểu      : $mode ($fstype)"
+    echo "  Phân vùng : $target  ($((z / 2048)) MiB -> $((new_sect / 2048)) MiB)"
+    echo "  Mục đích  : giải phóng ~${SHRINK_MIB} MiB cuối đĩa cho ESP"
+    echo "${Y}Thao tác này thay đổi filesystem/phân vùng thật. Phải có snapshot trước.${N}"
+    read -rp "Gõ SHRINK để xác nhận: " a
+    [ "$a" = "SHRINK" ] || return 1
+
+    if [ "$mode" = "std" ]; then
+        info "Kiểm tra filesystem (e2fsck)"
+        e2fsck -f -p "$ROOT_DEV"; local rc=$?
+        [ "$rc" -le 1 ] || { warn "e2fsck báo lỗi (mã $rc). Dừng."; return 1; }
+
+        bs=$(tune2fs -l "$ROOT_DEV" | awk -F: '/^Block size/{gsub(/ /,"",$2);print $2}')
+        minblk=$(resize2fs -P "$ROOT_DEV" 2>/dev/null | awk -F: '/minimum size/{gsub(/ /,"",$2);print $2}')
+        case "$bs$minblk" in (*[!0-9]*|"") warn "Không đọc được kích thước tối thiểu của filesystem."; return 1 ;; esac
+        min_mib=$(( minblk * bs / 1048576 + 1 ))
+        fs_mib=$(( new_sect / 2048 - 8 ))
+        if [ "$fs_mib" -le $((min_mib + 512)) ]; then
+            warn "Dữ liệu trong filesystem quá nhiều (tối thiểu ${min_mib} MiB), không thu nhỏ an toàn được."
+            return 1
+        fi
+        info "Thu nhỏ filesystem xuống ${fs_mib} MiB"
+        resize2fs "$ROOT_DEV" "${fs_mib}M" || { warn "resize2fs lỗi. Partition chưa bị đổi."; return 1; }
+
+        info "Thu nhỏ phân vùng $target"
+        shrink_partition "$target" "$new_sect" || { warn "Đổi kích thước phân vùng lỗi!"; return 1; }
+        resize2fs "$ROOT_DEV" >/dev/null 2>&1      # nở filesystem lấp đầy phân vùng mới
+    else
+        vgchange -ay "$vg" >/dev/null 2>&1
+        vg_free=$(vgs --noheadings --units m --nosuffix -o vg_free "$vg" | awk '{printf "%d",$1}')
+        need=$((SHRINK_MIB + 16))
+        if [ "$vg_free" -lt "$need" ]; then
+            red=$((need - vg_free + 64))
+            info "VG chỉ trống ${vg_free} MiB, thu nhỏ LV root thêm ${red} MiB"
+            lvreduce -r -y -L "-${red}M" "$ROOT_DEV" \
+                || { warn "lvreduce lỗi (thường do dữ liệu quá đầy). Chưa đổi phân vùng."; return 1; }
+        fi
+        new_pv_mib=$(( new_sect / 2048 - 2 ))
+        info "Thu nhỏ PV $target xuống ${new_pv_mib} MiB"
+        pvresize -y --setphysicalvolumesize "${new_pv_mib}m" "$target" \
+            || { warn "pvresize lỗi (có extent nằm ở cuối PV, cần pvmove thủ công). Chưa đổi phân vùng."; return 1; }
+        vgchange -an "$vg" >/dev/null 2>&1 || { warn "Không tắt được VG $vg. Dừng."; return 1; }
+        info "Thu nhỏ phân vùng $target"
+        shrink_partition "$target" "$new_sect" || { warn "Đổi kích thước phân vùng lỗi!"; return 1; }
+        vgchange -ay "$vg" >/dev/null 2>&1
+        pvresize -y "$target" >/dev/null 2>&1
+    fi
+    info "Đã giải phóng vùng trống ở cuối đĩa."
+    return 0
 }
 
 # --------------------------------------------------------------------------
@@ -64,15 +203,17 @@ fi
 
 # --------------------------------------------------------------------------
 step "Bước 1: Cài công cụ cần thiết trong live CD"
-need=()
-command -v sgdisk    >/dev/null || need+=(gdisk)
-command -v mkfs.vfat >/dev/null || need+=(dosfstools)
-command -v vgchange  >/dev/null || need+=(lvm2)
-command -v partprobe >/dev/null || need+=(parted)
-if [ "${#need[@]}" -gt 0 ]; then
-    info "Cài: ${need[*]}"
+need_pkgs=()
+command -v sgdisk    >/dev/null || need_pkgs+=(gdisk)
+command -v mkfs.vfat >/dev/null || need_pkgs+=(dosfstools)
+command -v vgchange  >/dev/null || need_pkgs+=(lvm2)
+command -v partprobe >/dev/null || need_pkgs+=(parted)
+command -v sfdisk    >/dev/null || need_pkgs+=(fdisk)
+command -v resize2fs >/dev/null || need_pkgs+=(e2fsprogs)
+if [ "${#need_pkgs[@]}" -gt 0 ]; then
+    info "Cài: ${need_pkgs[*]}"
     apt-get update -qq
-    apt-get install -y "${need[@]}" || die "Không cài được ${need[*]}"
+    apt-get install -y "${need_pkgs[@]}" || die "Không cài được ${need_pkgs[*]}"
 else
     info "Đã đủ công cụ."
 fi
@@ -95,16 +236,77 @@ read -rp "Gõ YES (viết hoa) để tiếp tục: " ans
 [ "$ans" = "YES" ] || die "Đã hủy."
 
 # --------------------------------------------------------------------------
-step "Bước 3: Chuyển MBR sang GPT, đưa backup GPT về cuối đĩa"
+step "Bước 3: Dò phân vùng root của hệ thống"
+vgchange -ay >/dev/null 2>&1
+ROOT_DEV="${ROOT_DEV:-}"
+if [ -z "$ROOT_DEV" ]; then
+    mkdir -p "$PROBE"
+    cands=()
+    while read -r dev fs; do
+        case "$fs" in ext2|ext3|ext4|xfs|btrfs) ;; *) continue ;; esac
+        if mount -o ro "$dev" "$PROBE" 2>/dev/null; then
+            if [ -f "$PROBE/etc/fstab" ] && [ -f "$PROBE/etc/os-release" ]; then
+                cands+=("$dev")
+            fi
+            umount "$PROBE"
+        fi
+    done < <(lsblk -nrpo PATH,FSTYPE "$DISK")
+
+    if   [ "${#cands[@]}" -eq 0 ]; then
+        die "Không tìm thấy phân vùng root. Chạy lại: sudo ROOT_DEV=/dev/xxx bash $0"
+    elif [ "${#cands[@]}" -eq 1 ]; then
+        ROOT_DEV="${cands[0]}"
+    else
+        echo "Tìm thấy nhiều ứng viên, chọn phân vùng root:"
+        PS3="Chọn số: "
+        select d in "${cands[@]}"; do
+            [ -n "${d:-}" ] && ROOT_DEV="$d" && break
+        done
+    fi
+fi
+[ -b "$ROOT_DEV" ] || die "$ROOT_DEV không phải block device."
+info "Phân vùng root: $ROOT_DEV"
+
+# --------------------------------------------------------------------------
+step "Bước 4: Kiểm tra chỗ trống, thu nhỏ nếu cần"
+if [ "$PT" = "gpt" ]; then
+    sgdisk -e "$DISK" >/dev/null 2>&1       # đưa backup GPT về cuối đĩa
+    partprobe "$DISK" 2>/dev/null; udevadm settle
+fi
+
+NEED_SHRINK=0
 if [ "$PT" = "dos" ]; then
-    sgdisk -g "$DISK" || die "sgdisk -g lỗi (thường do cuối đĩa không còn ~34 sector trống)."
+    DISK_SECT=$(blockdev --getsz "$DISK")
+    TAIL_FREE=$((DISK_SECT - $(disk_last_end)))
+    if [ "$TAIL_FREE" -lt 40 ]; then
+        warn "Cuối đĩa MBR không còn chỗ cho bảng GPT dự phòng (còn ${TAIL_FREE} sector)."
+        NEED_SHRINK=1
+    fi
+fi
+if [ -z "$(list_esp)" ]; then
+    GAP_MIB=$(( $(largest_free_sectors) / 2048 ))
+    info "Vùng trống liền kề lớn nhất: ${GAP_MIB} MiB (cần >= $((ESP_MIN_MIB + 2)) MiB cho ESP)"
+    [ "$GAP_MIB" -lt $((ESP_MIN_MIB + 2)) ] && NEED_SHRINK=1
+fi
+
+if [ "$NEED_SHRINK" -eq 1 ]; then
+    warn "Đĩa không đủ chỗ trống. Có thể tự thu nhỏ phân vùng cuối, hoặc bạn extend volume trên OpenStack."
+    do_shrink || die "Không thu nhỏ tự động được. Hãy extend volume thêm ~1 GiB trên OpenStack (hoặc tự thu nhỏ thủ công), rồi chạy lại. Chưa có thay đổi nào chưa hoàn tất ngoài những bước đã báo ở trên."
+else
+    info "Đủ chỗ trống, không cần thu nhỏ."
+fi
+
+# --------------------------------------------------------------------------
+step "Bước 5: Chuyển MBR sang GPT, đưa backup GPT về cuối đĩa"
+if [ "$PT" = "dos" ]; then
+    sgdisk -g "$DISK" || die "sgdisk -g lỗi."
 fi
 sgdisk -e "$DISK" || die "sgdisk -e lỗi."
 partprobe "$DISK"; udevadm settle; sleep 1
 sgdisk -p "$DISK"
 
 # --------------------------------------------------------------------------
-step "Bước 4: Tạo và format phân vùng ESP"
+step "Bước 6: Tạo và format phân vùng ESP"
 ESP_DEV=$(list_esp | head -n1)
 if [ -n "$ESP_DEV" ]; then
     fs=$(blkid -s TYPE -o value "$ESP_DEV" 2>/dev/null)
@@ -117,7 +319,7 @@ else
     free_mib=$(( (E - F + 1) / 2048 ))
     info "Vùng trống lớn nhất: ${free_mib} MiB"
     if [ "$free_mib" -lt $((ESP_MIN_MIB + 1)) ]; then
-        die "Không đủ vùng trống cho ESP (cần >= ${ESP_MIN_MIB} MiB). Hãy extend volume thêm ~1 GiB trên OpenStack, boot lại live CD rồi chạy lại script."
+        die "Không đủ vùng trống cho ESP (cần >= ${ESP_MIN_MIB} MiB). Extend volume thêm ~1 GiB rồi chạy lại."
     fi
     size=$ESP_MAX_MIB
     [ "$free_mib" -le "$size" ] && size=$((free_mib - 1))
@@ -137,38 +339,8 @@ ESP_UUID=$(blkid -s UUID -o value "$ESP_DEV")
 info "ESP: $ESP_DEV  UUID=$ESP_UUID"
 
 # --------------------------------------------------------------------------
-step "Bước 5: Dò phân vùng root của hệ thống"
+step "Bước 7: Mount hệ thống"
 vgchange -ay >/dev/null 2>&1
-ROOT_DEV="${ROOT_DEV:-}"
-if [ -z "$ROOT_DEV" ]; then
-    mkdir -p "$PROBE"
-    cands=()
-    while read -r dev fs; do
-        case "$fs" in ext2|ext3|ext4|xfs|btrfs) ;; *) continue ;; esac
-        if mount -o ro "$dev" "$PROBE" 2>/dev/null; then
-            if [ -f "$PROBE/etc/fstab" ] && [ -f "$PROBE/etc/os-release" ]; then
-                cands+=("$dev")
-            fi
-            umount "$PROBE"
-        fi
-    done < <(lsblk -nrpo PATH,FSTYPE "$DISK")
-
-    if   [ "${#cands[@]}" -eq 0 ]; then
-        die "Không tìm thấy phân vùng root. Chạy lại với: ROOT_DEV=/dev/xxx sudo -E bash $0"
-    elif [ "${#cands[@]}" -eq 1 ]; then
-        ROOT_DEV="${cands[0]}"
-    else
-        echo "Tìm thấy nhiều ứng viên, chọn phân vùng root:"
-        PS3="Chọn số: "
-        select d in "${cands[@]}"; do
-            [ -n "${d:-}" ] && ROOT_DEV="$d" && break
-        done
-    fi
-fi
-info "Phân vùng root: $ROOT_DEV"
-
-# --------------------------------------------------------------------------
-step "Bước 6: Mount hệ thống"
 mkdir -p "$MNT"
 mount "$ROOT_DEV" "$MNT" || die "Không mount được $ROOT_DEV"
 
@@ -195,7 +367,7 @@ if grep -Eq '^/dev/(sd|vd|hd|xvd)' "$MNT/etc/fstab"; then
 fi
 
 # --------------------------------------------------------------------------
-step "Bước 7: Cấu hình mạng (netplan)"
+step "Bước 8: Cấu hình mạng (netplan)"
 echo "Cấu hình netplan hiện tại:"
 cat "$MNT"/etc/netplan/*.yaml 2>/dev/null || echo "(không có file netplan)"
 echo
@@ -207,7 +379,7 @@ FIX_NET=0
 case "$nans" in y|Y) FIX_NET=1 ;; esac
 
 # --------------------------------------------------------------------------
-step "Bước 8: Chạy cấu hình trong chroot (cài GRUB UEFI, virtio, fstab)"
+step "Bước 9: Chạy cấu hình trong chroot (cài GRUB UEFI, virtio, fstab)"
 cat > "$MNT/root/fix-uefi-chroot.sh" <<'CHROOT_EOF'
 #!/bin/bash
 set -e
@@ -234,7 +406,15 @@ sed -i '\#[[:space:]]/boot/efi[[:space:]]#d' /etc/fstab
 [ -n "$(tail -c1 /etc/fstab)" ] && echo >> /etc/fstab
 echo "UUID=$ESP_UUID  /boot/efi  vfat  umask=0077  0  1" >> /etc/fstab
 
+# Ubuntu 24.04 có thể có dòng /var/lib/grub/esp trỏ tới /dev/disk/by-id/...-part1 của đĩa cũ.
+# Gói grub-efi-amd64-signed mount dòng này khi cài, nên phải trỏ về ESP mới.
+if grep -q '[[:space:]]/var/lib/grub/esp[[:space:]]' /etc/fstab; then
+    echo "[chroot] Sửa dòng /var/lib/grub/esp trong fstab"
+    sed -i -E "s|^[^#[:space:]]+([[:space:]]+/var/lib/grub/esp[[:space:]])|UUID=$ESP_UUID\1|" /etc/fstab
+fi
+
 echo "[chroot] Cài GRUB UEFI"
+dpkg --configure -a || true
 apt-get update
 apt-get install -y -o Dpkg::Options::=--force-confold \
     grub-efi-amd64 grub-efi-amd64-signed shim-signed efibootmgr
@@ -280,7 +460,7 @@ rm -f "$MNT/root/fix-uefi-chroot.sh"
 [ "$rc" -eq 0 ] || die "Bước trong chroot bị lỗi (mã $rc). Xem thông báo phía trên. Bảng phân vùng đã được đổi sang GPT, ĐỪNG reboot khi chưa sửa xong."
 
 # --------------------------------------------------------------------------
-step "Bước 9: Dọn dẹp"
+step "Bước 10: Dọn dẹp"
 cleanup
 trap - EXIT
 sync
