@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================================================
-# fix-boot-kvm.sh  (v3)
+# convert.sh  (v5)
 # Sửa VM Ubuntu/Debian restore (Acronis, từ Azure/VMware/vật lý...) để boot
 # trên KVM/OpenStack:
 #   - Chuyển MBR sang GPT, tạo ESP + bios_grub
@@ -10,12 +10,12 @@
 # Hỗ trợ: root là ext2/3/4 trên phân vùng thường, hoặc trên LVM.
 # Chạy trong Ubuntu Desktop Live (có mạng), bằng quyền root:
 #
-#     sudo bash fix-boot-kvm.sh            # mặc định ổ /dev/vda
-#     sudo bash fix-boot-kvm.sh /dev/sda   # chỉ định ổ khác
+#     sudo bash convert.sh            # mặc định ổ /dev/vda
+#     sudo bash convert.sh /dev/sda   # chỉ định ổ khác
 #
 # Biến môi trường tùy chọn:
 #     ROOT_DEV=/dev/vda1   bỏ qua bước tự dò phân vùng root
-#                          (chạy: sudo ROOT_DEV=... bash fix-boot-kvm.sh)
+#                          (chạy: sudo ROOT_DEV=... bash convert.sh)
 #
 # Khi đĩa không còn chỗ trống cho ESP, script đề nghị tự thu nhỏ phân vùng
 # cuối (chỉ khi đó là ext2/3/4 hoặc PV của LVM), có hỏi xác nhận.
