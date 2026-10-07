@@ -385,6 +385,7 @@ cat > "$MNT/root/fix-uefi-chroot.sh" <<'CHROOT_EOF'
 set -e
 ESP_UUID="$1"
 FIX_NET="$2"
+ESP_DEV="${3:-}"
 export DEBIAN_FRONTEND=noninteractive
 
 # DNS tạm thời
@@ -412,6 +413,14 @@ if grep -q '[[:space:]]/var/lib/grub/esp[[:space:]]' /etc/fstab; then
     echo "[chroot] Sửa dòng /var/lib/grub/esp trong fstab"
     sed -i -E "s|^[^#[:space:]]+([[:space:]]+/var/lib/grub/esp[[:space:]])|UUID=$ESP_UUID\1|" /etc/fstab
 fi
+
+# Gói grub-efi-amd64-signed lấy ESP từ debconf (grub-efi/install_devices), giá trị cũ
+# trỏ tới /dev/disk/by-id/...-part1 của đĩa gốc nên mount lỗi. Trỏ lại về ESP mới.
+ESP_LINK="/dev/disk/by-uuid/$ESP_UUID"
+[ -e "$ESP_LINK" ] || ESP_LINK="$ESP_DEV"
+echo "[chroot] Đặt debconf grub-efi/install_devices = $ESP_LINK"
+echo "grub-efi-amd64 grub-efi/install_devices multiselect $ESP_LINK" | debconf-set-selections
+echo "grub-efi-amd64 grub-efi/install_devices_empty boolean false" | debconf-set-selections
 
 echo "[chroot] Cài GRUB UEFI"
 dpkg --configure -a || true
@@ -454,7 +463,7 @@ ls -R /boot/efi/EFI
 CHROOT_EOF
 chmod +x "$MNT/root/fix-uefi-chroot.sh"
 
-chroot "$MNT" /bin/bash /root/fix-uefi-chroot.sh "$ESP_UUID" "$FIX_NET"
+chroot "$MNT" /bin/bash /root/fix-uefi-chroot.sh "$ESP_UUID" "$FIX_NET" "$ESP_DEV"
 rc=$?
 rm -f "$MNT/root/fix-uefi-chroot.sh"
 [ "$rc" -eq 0 ] || die "Bước trong chroot bị lỗi (mã $rc). Xem thông báo phía trên. Bảng phân vùng đã được đổi sang GPT, ĐỪNG reboot khi chưa sửa xong."
