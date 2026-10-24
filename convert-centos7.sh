@@ -23,6 +23,11 @@
 # Biến môi trường tùy chọn:
 #     ROOT_DEV=/dev/mapper/centos-root   bỏ qua bước tự dò phân vùng root
 # ==========================================================================
+# Script dùng cú pháp bash; nếu bị gọi bằng "sh convert-centos7.sh" (dash) thì tự chạy lại bằng bash
+if [ -z "${BASH_VERSION:-}" ]; then
+    [ -f "$0" ] && exec bash "$0" "$@"
+    echo "Script cần bash, hãy chạy: sudo bash convert-centos7.sh" >&2; exit 1
+fi
 set -u
 
 DISK="${1:-/dev/vda}"
@@ -221,6 +226,8 @@ FIX_NET="${3:-0}"
 VAULT=http://vault.centos.org
 RPMS=/root/efi-rpms
 EFIDIR=/boot/efi/EFI/centos
+# Live CD truyền LANG=C.UTF-8, CentOS 7 không có locale này (dracut/yum báo setlocale)
+export LC_ALL=C LANG=C
 
 # DNS tạm thời
 if [ -e /etc/resolv.conf ] || [ -L /etc/resolv.conf ]; then
@@ -357,7 +364,7 @@ echo 'add_drivers+=" virtio_blk virtio_scsi virtio_pci virtio_net "' > /etc/drac
 for d in /lib/modules/*; do
     v=${d##*/}
     [ -f "/boot/vmlinuz-$v" ] || continue
-    echo "  dracut $v"
+    echo "  dracut $v (initramfs đầy đủ driver, có thể mất vài phút)"
     # -N: initramfs đầy đủ driver, không phụ thuộc phần cứng lúc tạo (đang ở live CD)
     dracut -f -N "/boot/initramfs-$v.img" "$v"
 done

@@ -20,6 +20,11 @@
 # Khi đĩa không còn chỗ trống cho ESP, script đề nghị tự thu nhỏ phân vùng
 # cuối (chỉ khi đó là ext2/3/4 hoặc PV của LVM), có hỏi xác nhận.
 # ==========================================================================
+# Script dùng cú pháp bash; nếu bị gọi bằng "sh convert.sh" (dash) thì tự chạy lại bằng bash
+if [ -z "${BASH_VERSION:-}" ]; then
+    [ -f "$0" ] && exec bash "$0" "$@"
+    echo "Script cần bash, hãy chạy: sudo bash convert.sh" >&2; exit 1
+fi
 set -u
 
 DISK="${1:-/dev/vda}"
