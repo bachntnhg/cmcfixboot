@@ -15,6 +15,10 @@
 #   - Thêm driver virtio vào initramfs, sửa mạng (ifcfg), bật SELinux relabel
 # Sau khi chạy, VM CHỈ boot được UEFI.
 #
+# Nếu fstab đã có /boot/efi (VM cài kiểu UEFI: Hyper-V Gen 2, VMware EFI...), script
+# chạy chế độ "chỉ sửa cấu hình": giữ nguyên phân vùng, đặt EFI/BOOT/BOOTX64.EFI,
+# tạo lại grub.cfg, virtio, mạng, SELinux relabel (chỉ tải gói nếu ESP thiếu file).
+#
 # Chạy trong Ubuntu Live (có mạng), bằng quyền root:
 #
 #     sudo bash convert-centos7.sh            # mặc định ổ /dev/vda
@@ -52,6 +56,8 @@ cleanup() {
 trap cleanup EXIT
 
 part_num() { cat "/sys/class/block/$(basename "$1")/partition" 2>/dev/null; }
+# Thiết bị theo cột 1 của fstab (UUID=, LABEL= hoặc /dev/...)
+spec_dev() { case "$1" in /dev/*) echo "$1" ;; *) findfs "$1" 2>/dev/null ;; esac; }
 
 # --------------------------------------------------------------------------
 step "Bước 0: Kiểm tra ban đầu"
@@ -152,29 +158,39 @@ case "$ROOT_FS" in
     *) die "Root là '$ROOT_FS', GRUB có thể không đọc được /boot trên đó. Dừng." ;;
 esac
 
-if awk '!/^[[:space:]]*#/ && $2=="/boot/efi" {f=1} END{exit !f}' "$MNT/etc/fstab"; then
-    die "fstab đã có /boot/efi. Hệ thống này không phải trường hợp BIOS thuần, kiểm tra thủ công."
+BOOT_SPEC=$(awk '!/^[[:space:]]*#/ && $2=="/boot" {print $1; exit}' "$MNT/etc/fstab")
+ESP_SPEC=$(awk '!/^[[:space:]]*#/ && $2=="/boot/efi" {print $1; exit}' "$MNT/etc/fstab")
+BOOT_DEV=""
+if [ -n "$BOOT_SPEC" ]; then
+    BOOT_DEV=$(spec_dev "$BOOT_SPEC")
+    [ -n "$BOOT_DEV" ] && [ -b "$BOOT_DEV" ] || die "fstab có /boot ($BOOT_SPEC) nhưng không tìm thấy thiết bị."
 fi
 
-BOOT_SPEC=$(awk '!/^[[:space:]]*#/ && $2=="/boot" {print $1; exit}' "$MNT/etc/fstab")
-[ -n "$BOOT_SPEC" ] || die "Không có phân vùng /boot riêng. Trường hợp này cần chỗ trống cho ESP, script chưa hỗ trợ."
-case "$BOOT_SPEC" in
-    /dev/*) BOOT_DEV="$BOOT_SPEC" ;;
-    *)      BOOT_DEV=$(findfs "$BOOT_SPEC" 2>/dev/null) ;;
-esac
-[ -n "${BOOT_DEV:-}" ] && [ -b "$BOOT_DEV" ] || die "fstab có /boot ($BOOT_SPEC) nhưng không tìm thấy thiết bị."
-BOOT_PARENT=$(lsblk -nrpo PKNAME "$BOOT_DEV" 2>/dev/null | head -n1)
-[ "$(readlink -f "$BOOT_PARENT")" = "$(readlink -f "$DISK")" ] || die "/boot ($BOOT_DEV) không nằm trực tiếp trên $DISK."
-BOOT_N=$(part_num "$BOOT_DEV")
-[ -n "$BOOT_N" ] || die "Không xác định được số thứ tự phân vùng của $BOOT_DEV."
-BOOT_MIB=$(( $(blockdev --getsz "$BOOT_DEV") / 2048 ))
-[ "$BOOT_MIB" -ge 100 ] || die "Phân vùng /boot chỉ ${BOOT_MIB} MiB, quá nhỏ để làm ESP."
+if [ -n "$ESP_SPEC" ]; then
+    # Đã cài kiểu UEFI (Hyper-V Gen 2, VMware EFI...): giữ nguyên phân vùng, chỉ sửa cấu hình
+    MODE=uefi
+    ESP_DEV=$(spec_dev "$ESP_SPEC")
+    [ -n "$ESP_DEV" ] && [ -b "$ESP_DEV" ] || die "fstab có /boot/efi ($ESP_SPEC) nhưng không tìm thấy thiết bị."
+    ESP_FS=$(blkid -p -s TYPE -o value "$ESP_DEV")
+    [ "$ESP_FS" = "vfat" ] || die "ESP $ESP_DEV không phải vfat (${ESP_FS:-không rõ}). Kiểm tra thủ công."
+    info "Hệ thống đã cài kiểu UEFI. ESP: $ESP_DEV${BOOT_DEV:+, /boot: $BOOT_DEV}"
+    info "Chế độ chỉ sửa cấu hình: không đổi phân vùng, không format."
+else
+    MODE=bios
+    [ -n "$BOOT_DEV" ] || die "Không có phân vùng /boot riêng. Trường hợp này cần chỗ trống cho ESP, script chưa hỗ trợ."
+    BOOT_PARENT=$(lsblk -nrpo PKNAME "$BOOT_DEV" 2>/dev/null | head -n1)
+    [ "$(readlink -f "$BOOT_PARENT")" = "$(readlink -f "$DISK")" ] || die "/boot ($BOOT_DEV) không nằm trực tiếp trên $DISK."
+    BOOT_N=$(part_num "$BOOT_DEV")
+    [ -n "$BOOT_N" ] || die "Không xác định được số thứ tự phân vùng của $BOOT_DEV."
+    BOOT_MIB=$(( $(blockdev --getsz "$BOOT_DEV") / 2048 ))
+    [ "$BOOT_MIB" -ge 100 ] || die "Phân vùng /boot chỉ ${BOOT_MIB} MiB, quá nhỏ để làm ESP."
 
-mount -o ro "$BOOT_DEV" "$PROBE" || die "Không mount được /boot ($BOOT_DEV)"
-BOOT_USED=$(du -sm "$PROBE" | cut -f1)
-ROOT_FREE=$(df -Pm "$MNT" | awk 'NR==2 {print $4}')
-info "/boot: $BOOT_DEV (${BOOT_MIB} MiB, đang dùng ${BOOT_USED} MiB); root còn trống ${ROOT_FREE} MiB"
-[ "$ROOT_FREE" -ge $((BOOT_USED + 512)) ] || die "Root không đủ chỗ để chứa /boot (cần ~$((BOOT_USED + 512)) MiB)."
+    mount -o ro "$BOOT_DEV" "$PROBE" || die "Không mount được /boot ($BOOT_DEV)"
+    BOOT_USED=$(du -sm "$PROBE" | cut -f1)
+    ROOT_FREE=$(df -Pm "$MNT" | awk 'NR==2 {print $4}')
+    info "/boot: $BOOT_DEV (${BOOT_MIB} MiB, đang dùng ${BOOT_USED} MiB); root còn trống ${ROOT_FREE} MiB"
+    [ "$ROOT_FREE" -ge $((BOOT_USED + 512)) ] || die "Root không đủ chỗ để chứa /boot (cần ~$((BOOT_USED + 512)) MiB)."
+fi
 
 # Mạng: ifcfg của Hyper-V thường gắn HWADDR cũ; IP tĩnh cũ không khớp port Neutron
 NS="$MNT/etc/sysconfig/network-scripts"
@@ -204,17 +220,31 @@ case "$nans" in y|Y) FIX_NET=1 ;; esac
 
 echo
 echo "${Y}${B}KẾ HOẠCH${N}"
-echo "  1. Chép /boot ($BOOT_DEV) vào /boot trên root ($ROOT_DEV), so sánh bản chép"
-echo "  2. FORMAT $BOOT_DEV thành ESP FAT32, đổi type phân vùng sang EFI System"
-echo "  3. fstab: tắt dòng /boot, thêm /boot/efi"
-echo "  4. Cài grub2-efi + shim từ $VAULT/$VER, tạo grub.cfg UEFI"
-echo "  5. initramfs có virtio, mạng: $([ "$FIX_NET" = 1 ] && echo "DHCP eth0" || echo "giữ nguyên, bỏ HWADDR/UUID"), SELinux relabel"
+NET_PLAN=$([ "$FIX_NET" = 1 ] && echo "DHCP eth0" || echo "giữ nguyên, bỏ HWADDR/UUID")
+if [ "$MODE" = "uefi" ]; then
+    echo "  1. Giữ nguyên phân vùng; chỉ cài lại grub2-efi + shim từ $VAULT/$VER nếu ESP thiếu file"
+    echo "  2. Đặt EFI/BOOT/BOOTX64.EFI (boot không cần NVRAM), tạo lại grub.cfg UEFI"
+    echo "  3. initramfs có virtio, mạng: $NET_PLAN, SELinux relabel"
+else
+    echo "  1. Chép /boot ($BOOT_DEV) vào /boot trên root ($ROOT_DEV), so sánh bản chép"
+    echo "  2. FORMAT $BOOT_DEV thành ESP FAT32, đổi type phân vùng sang EFI System"
+    echo "  3. fstab: tắt dòng /boot, thêm /boot/efi"
+    echo "  4. Cài grub2-efi + shim từ $VAULT/$VER, tạo grub.cfg UEFI"
+    echo "  5. initramfs có virtio, mạng: $NET_PLAN, SELinux relabel"
+fi
 echo "${Y}Thao tác này GHI lên đĩa. Hãy chắc chắn đã snapshot/backup volume trước.${N}"
 read -rp "Gõ YES (viết hoa) để tiếp tục: " ans
 [ "$ans" = "YES" ] || die "Đã hủy. Chưa có thay đổi nào trên đĩa."
 
 # --------------------------------------------------------------------------
 step "Bước 5: Tải trước gói GRUB UEFI (chưa đổi gì trên đĩa)"
+if [ "$MODE" = "uefi" ]; then
+    if [ -n "$BOOT_DEV" ]; then
+        mount "$BOOT_DEV" "$MNT/boot" || die "Không mount được /boot ($BOOT_DEV)"
+    fi
+    mkdir -p "$MNT/boot/efi"
+    mount "$ESP_DEV" "$MNT/boot/efi" || die "Không mount được ESP ($ESP_DEV)"
+fi
 for i in /dev /dev/pts /proc /sys /run; do
     mount --bind "$i" "$MNT$i" || die "Không bind-mount $i"
 done
@@ -291,8 +321,11 @@ EOF
 fi
 
 # ---------------- PHASE=configure ----------------
-echo "[chroot] Cài gói GRUB UEFI đã tải"
-rpm -Uvh --replacepkgs "$RPMS"/*.rpm
+# Hệ thống đã UEFI và ESP đủ file thì không có gói nào được tải
+if ls "$RPMS"/*.rpm >/dev/null 2>&1; then
+    echo "[chroot] Cài gói GRUB UEFI đã tải"
+    rpm -Uvh --replacepkgs "$RPMS"/*.rpm
+fi
 
 SHIM=""
 for f in shimx64.efi shim.efi; do
@@ -415,59 +448,79 @@ rm -rf "$RPMS"
 CHROOT_EOF
 chmod +x "$MNT/root/c7-efi-chroot.sh"
 
-chroot "$MNT" /bin/bash /root/c7-efi-chroot.sh download "$VER" \
-    || die "Không tải được gói GRUB UEFI từ vault. Đĩa chưa bị đổi (chỉ thêm file repo và /root/efi-rpms)."
-
-# --------------------------------------------------------------------------
-step "Bước 6: Chép /boot vào filesystem root"
-if [ -n "$(ls -A "$MNT/boot" 2>/dev/null)" ]; then
-    HIDDEN="/root/boot-hidden-$(date +%s)"
-    warn "Thư mục /boot trên root (bị che bởi mount) có sẵn file, chuyển sang $HIDDEN"
-    mv "$MNT/boot" "$MNT$HIDDEN" || die "Không chuyển được thư mục /boot cũ."
-    mkdir "$MNT/boot"
+NEED_DL=1
+if [ "$MODE" = "uefi" ]; then
+    # Chỉ tải gói khi ESP thiếu file bootloader của CentOS
+    if [ -f "$MNT/boot/efi/EFI/centos/grubx64.efi" ] \
+       && { [ -f "$MNT/boot/efi/EFI/centos/shimx64.efi" ] || [ -f "$MNT/boot/efi/EFI/centos/shim.efi" ]; }; then
+        NEED_DL=0
+    fi
 fi
-cp -a "$PROBE/." "$MNT/boot/" || die "Chép /boot lỗi. Phân vùng /boot cũ chưa bị đổi."
-sync
-diff -rq --no-dereference "$PROBE" "$MNT/boot" \
-    || die "Bản chép /boot không khớp bản gốc. Phân vùng /boot cũ chưa bị đổi."
-info "Đã chép và kiểm tra ${BOOT_USED} MiB."
-umount "$PROBE"
-
-# --------------------------------------------------------------------------
-step "Bước 7: Biến $BOOT_DEV thành ESP"
-wipefs -a "$BOOT_DEV" >/dev/null || die "wipefs lỗi."
-mkfs.vfat -F32 -n EFI "$BOOT_DEV" || die "mkfs.vfat lỗi. /boot đã nằm trên root, nhưng fstab chưa sửa: ĐỪNG reboot."
-if [ "$PT" = "gpt" ]; then
-    NEWTYPE="$ESP_GUID"
+if [ "$NEED_DL" = "1" ]; then
+    chroot "$MNT" /bin/bash /root/c7-efi-chroot.sh download "$VER" \
+        || die "Không tải được gói GRUB UEFI từ vault. Đĩa chưa bị đổi (chỉ thêm file repo và /root/efi-rpms)."
 else
-    NEWTYPE="ef"
+    rm -rf "$MNT/root/efi-rpms"
+    info "ESP đã có grubx64.efi và shim, không cần tải gói."
 fi
-# Đĩa đang bận (root LV đang mount) nên sfdisk có thể báo không re-read được; kiểm tra bằng cách đọc lại
-sfdisk --part-type "$DISK" "$BOOT_N" "$NEWTYPE" >/dev/null 2>&1
-CURTYPE=$(sfdisk --part-type "$DISK" "$BOOT_N" 2>/dev/null | tr 'A-F' 'a-f')
-[ "$CURTYPE" = "$NEWTYPE" ] || die "Không đổi được type phân vùng $BOOT_N sang $NEWTYPE (đang là $CURTYPE)."
-udevadm settle
-ESP_UUID=$(blkid -s UUID -o value "$BOOT_DEV")
-[ -n "$ESP_UUID" ] || die "Không đọc được UUID của ESP $BOOT_DEV"
-info "ESP: $BOOT_DEV  UUID=$ESP_UUID  type=$CURTYPE"
 
-info "Cập nhật fstab"
-cp -a "$MNT/etc/fstab" "$MNT/etc/fstab.bak.$(date +%s)"
-awk '!/^[[:space:]]*#/ && $2=="/boot" {print "#" $0; next} {print}' "$MNT/etc/fstab" > "$MNT/etc/fstab.new" \
-    && mv -f "$MNT/etc/fstab.new" "$MNT/etc/fstab"
-[ -n "$(tail -c1 "$MNT/etc/fstab")" ] && echo >> "$MNT/etc/fstab"
-echo "UUID=$ESP_UUID  /boot/efi  vfat  umask=0077,shortname=winnt,nofail  0 0" >> "$MNT/etc/fstab"
-grep -E '[[:space:]]/boot(/efi)?[[:space:]]' "$MNT/etc/fstab"
+if [ "$MODE" = "bios" ]; then
+    # ----------------------------------------------------------------------
+    step "Bước 6: Chép /boot vào filesystem root"
+    if [ -n "$(ls -A "$MNT/boot" 2>/dev/null)" ]; then
+        HIDDEN="/root/boot-hidden-$(date +%s)"
+        warn "Thư mục /boot trên root (bị che bởi mount) có sẵn file, chuyển sang $HIDDEN"
+        mv "$MNT/boot" "$MNT$HIDDEN" || die "Không chuyển được thư mục /boot cũ."
+        mkdir "$MNT/boot"
+    fi
+    cp -a "$PROBE/." "$MNT/boot/" || die "Chép /boot lỗi. Phân vùng /boot cũ chưa bị đổi."
+    sync
+    diff -rq --no-dereference "$PROBE" "$MNT/boot" \
+        || die "Bản chép /boot không khớp bản gốc. Phân vùng /boot cũ chưa bị đổi."
+    info "Đã chép và kiểm tra ${BOOT_USED} MiB."
+    umount "$PROBE"
 
-mkdir -p "$MNT/boot/efi"
-mount "$BOOT_DEV" "$MNT/boot/efi" || die "Không mount được ESP"
+    # ----------------------------------------------------------------------
+    step "Bước 7: Biến $BOOT_DEV thành ESP"
+    wipefs -a "$BOOT_DEV" >/dev/null || die "wipefs lỗi."
+    mkfs.vfat -F32 -n EFI "$BOOT_DEV" || die "mkfs.vfat lỗi. /boot đã nằm trên root, nhưng fstab chưa sửa: ĐỪNG reboot."
+    if [ "$PT" = "gpt" ]; then
+        NEWTYPE="$ESP_GUID"
+    else
+        NEWTYPE="ef"
+    fi
+    # Đĩa đang bận (root LV đang mount) nên sfdisk có thể báo không re-read được; kiểm tra bằng cách đọc lại
+    sfdisk --part-type "$DISK" "$BOOT_N" "$NEWTYPE" >/dev/null 2>&1
+    CURTYPE=$(sfdisk --part-type "$DISK" "$BOOT_N" 2>/dev/null | tr 'A-F' 'a-f')
+    [ "$CURTYPE" = "$NEWTYPE" ] || die "Không đổi được type phân vùng $BOOT_N sang $NEWTYPE (đang là $CURTYPE)."
+    udevadm settle
+    ESP_UUID=$(blkid -s UUID -o value "$BOOT_DEV")
+    [ -n "$ESP_UUID" ] || die "Không đọc được UUID của ESP $BOOT_DEV"
+    info "ESP: $BOOT_DEV  UUID=$ESP_UUID  type=$CURTYPE"
+
+    info "Cập nhật fstab"
+    cp -a "$MNT/etc/fstab" "$MNT/etc/fstab.bak.$(date +%s)"
+    awk '!/^[[:space:]]*#/ && $2=="/boot" {print "#" $0; next} {print}' "$MNT/etc/fstab" > "$MNT/etc/fstab.new" \
+        && mv -f "$MNT/etc/fstab.new" "$MNT/etc/fstab"
+    [ -n "$(tail -c1 "$MNT/etc/fstab")" ] && echo >> "$MNT/etc/fstab"
+    echo "UUID=$ESP_UUID  /boot/efi  vfat  umask=0077,shortname=winnt,nofail  0 0" >> "$MNT/etc/fstab"
+    grep -E '[[:space:]]/boot(/efi)?[[:space:]]' "$MNT/etc/fstab"
+
+    mkdir -p "$MNT/boot/efi"
+    mount "$BOOT_DEV" "$MNT/boot/efi" || die "Không mount được ESP"
+fi
 
 # --------------------------------------------------------------------------
 step "Bước 8: Cấu hình trong chroot (GRUB UEFI, virtio, mạng)"
 chroot "$MNT" /bin/bash /root/c7-efi-chroot.sh configure "$VER" "$FIX_NET"
 rc=$?
 rm -f "$MNT/root/c7-efi-chroot.sh"
-[ "$rc" -eq 0 ] || die "Bước trong chroot bị lỗi (mã $rc). /boot đã chuyển vào root và $BOOT_DEV đã là ESP, ĐỪNG reboot khi chưa sửa xong."
+if [ "$rc" -ne 0 ]; then
+    if [ "$MODE" = "bios" ]; then
+        die "Bước trong chroot bị lỗi (mã $rc). /boot đã chuyển vào root và $BOOT_DEV đã là ESP, ĐỪNG reboot khi chưa sửa xong."
+    fi
+    die "Bước trong chroot bị lỗi (mã $rc). Phân vùng không bị đổi; xem thông báo phía trên."
+fi
 
 # --------------------------------------------------------------------------
 step "Bước 9: Dọn dẹp"
@@ -483,4 +536,6 @@ echo "  2. Lần boot đầu SELinux relabel toàn bộ, máy tự reboot thêm 
 echo "  3. Sau khi boot, kiểm tra:"
 echo "       [ -d /sys/firmware/efi ] && echo UEFI || echo BIOS"
 echo "       lsblk -f; ip a"
-echo "  Lưu ý: VM giờ CHỈ boot được UEFI. /boot nằm trên root, fstab cũ ở /etc/fstab.bak.*"
+if [ "$MODE" = "bios" ]; then
+    echo "  Lưu ý: VM giờ CHỈ boot được UEFI. /boot nằm trên root, fstab cũ ở /etc/fstab.bak.*"
+fi
