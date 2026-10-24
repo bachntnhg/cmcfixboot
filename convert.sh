@@ -490,7 +490,39 @@ restore_dns() {
         mv -f /etc/resolv.conf.livebak /etc/resolv.conf
     fi
 }
-trap restore_dns EXIT
+# Không cho gói tự khởi động dịch vụ trong chroot (MySQL... sẽ lỗi khi cấu hình)
+POLICY_RC=""
+if [ ! -e /usr/sbin/policy-rc.d ]; then
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+    chmod 755 /usr/sbin/policy-rc.d
+    POLICY_RC=1
+fi
+chroot_cleanup() {
+    restore_dns
+    if [ -n "$POLICY_RC" ]; then rm -f /usr/sbin/policy-rc.d; fi
+}
+trap chroot_cleanup EXIT
+
+# apt-get install nhưng không dừng vì gói KHÁC lỗi cấu hình (ví dụ mysql-server cài dở từ
+# trước): chỉ báo lỗi khi chính các gói cần cài chưa vào trạng thái installed
+apt_install() {
+    local p st bad=""
+    apt-get install -y -o Dpkg::Options::=--force-confold "$@" && return 0
+    for p in "$@"; do
+        st=$(dpkg-query -W -f='${Status}' "$p" 2>/dev/null)
+        case "$st" in
+            "install ok installed"|"install ok triggers-pending"|"install ok triggers-awaited") ;;
+            *) bad="$bad $p" ;;
+        esac
+    done
+    if [ -n "$bad" ]; then
+        echo "[chroot] LỖI: các gói cần thiết chưa cài xong:$bad"; return 1
+    fi
+    echo "[chroot] CẢNH BÁO: apt báo lỗi ở gói khác, các gói cần thiết ($*) đã cài xong. Gói đang lỗi:"
+    dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 !~ /^(ii|rc|un)/ {print "    " $0}'
+    echo "[chroot] Sau khi VM boot, sửa các gói này bằng: sudo dpkg --configure -a"
+    return 0
+}
 
 echo "[chroot] Cập nhật fstab"
 cp -a /etc/fstab "/etc/fstab.bak.$(date +%s)"
@@ -525,14 +557,13 @@ dpkg --configure -a || true
 if ! apt-get update --allow-releaseinfo-change && ! apt-get update; then
     echo "[chroot] CẢNH BÁO: apt-get update có lỗi (thường do repo bên thứ ba), tiếp tục với các repo còn lại"
 fi
-apt-get install -y -o Dpkg::Options::=--force-confold \
-    grub-efi-amd64 grub-efi-amd64-signed shim-signed efibootmgr
+apt_install grub-efi-amd64 grub-efi-amd64-signed shim-signed efibootmgr
 
 if [ "$REMOVE_AZURE" = "1" ]; then
     echo "[chroot] Chuyển từ kernel azure sang kernel generic"
     # Luôn cài gói meta linux-generic để kernel generic tiếp tục được cập nhật
     echo "[chroot] Cài gói meta linux-generic"
-    apt-get install -y linux-generic
+    apt_install linux-generic
     if ! ls /boot/vmlinuz-*-generic >/dev/null 2>&1; then
         echo "[chroot] LỖI: không có kernel generic, không gỡ kernel azure."; exit 1
     fi
@@ -541,7 +572,13 @@ if [ "$REMOVE_AZURE" = "1" ]; then
     if [ -n "$AZ_PKGS" ]; then
         echo "[chroot] Gỡ: $AZ_PKGS"
         # shellcheck disable=SC2086
-        apt-get purge -y $AZ_PKGS
+        apt-get purge -y $AZ_PKGS \
+            || echo "[chroot] CẢNH BÁO: apt báo lỗi khi gỡ kernel azure (có thể do gói khác), kiểm tra lại"
+        AZ_LEFT=$(dpkg-query -W -f='${Package} ${db:Status-Abbrev}\n' 2>/dev/null \
+            | awk '$2 ~ /^ii/ && $1 ~ /^linux-image-/ && $1 ~ /azure/ {print $1}')
+        if [ -n "$AZ_LEFT" ]; then
+            echo "[chroot] CẢNH BÁO: kernel azure chưa gỡ hết ($AZ_LEFT), GRUB có thể vẫn boot kernel azure"
+        fi
     fi
 fi
 
@@ -622,7 +659,7 @@ fi
 if [ -n "$BIOS_DISK" ]; then
     echo "[chroot] Cài thêm GRUB legacy (BIOS) lên $BIOS_DISK"
     # grub-pc-bin không xung đột với grub-efi-amd64 (khác với gói grub-pc)
-    apt-get install -y grub-pc-bin
+    apt_install grub-pc-bin
     grub-install --target=i386-pc --recheck "$BIOS_DISK"
 
     echo "[chroot] Cài hook apt tự cài lại GRUB BIOS khi grub-pc-bin được nâng cấp"
