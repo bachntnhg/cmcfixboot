@@ -519,7 +519,12 @@ echo "grub-efi-amd64 grub2/update_nvram boolean false" | debconf-set-selections
 
 echo "[chroot] Cài GRUB UEFI"
 dpkg --configure -a || true
-apt-get update
+# Repo bên thứ ba (PPA đổi Label/Origin, repo chết...) làm apt-get update trả lỗi dù repo
+# chính vẫn cập nhật được: chấp nhận đổi thông tin release, lỗi còn lại thì vẫn đi tiếp
+# (apt-get install phía sau sẽ báo lỗi nếu thật sự thiếu gói)
+if ! apt-get update --allow-releaseinfo-change && ! apt-get update; then
+    echo "[chroot] CẢNH BÁO: apt-get update có lỗi (thường do repo bên thứ ba), tiếp tục với các repo còn lại"
+fi
 apt-get install -y -o Dpkg::Options::=--force-confold \
     grub-efi-amd64 grub-efi-amd64-signed shim-signed efibootmgr
 
@@ -704,7 +709,12 @@ chmod +x "$MNT/root/convert-chroot.sh"
 chroot "$MNT" /bin/bash /root/convert-chroot.sh "$ESP_UUID" "$FIX_NET" "$ESP_DEV" "$REMOVE_AZURE" "$BIOS_DISK" "$IS_AZURE"
 rc=$?
 rm -f "$MNT/root/convert-chroot.sh"
-[ "$rc" -eq 0 ] || die "Bước trong chroot bị lỗi (mã $rc). Xem thông báo phía trên. Bảng phân vùng đã được đổi sang GPT, ĐỪNG reboot khi chưa sửa xong."
+if [ "$rc" -ne 0 ]; then
+    if [ "$PT" = "dos" ]; then
+        die "Bước trong chroot bị lỗi (mã $rc). Xem thông báo phía trên. Bảng phân vùng đã được đổi sang GPT, ĐỪNG reboot khi chưa sửa xong."
+    fi
+    die "Bước trong chroot bị lỗi (mã $rc). Xem thông báo phía trên. Đĩa vốn là GPT, phân vùng không bị đổi; sửa lỗi rồi chạy lại script."
+fi
 
 # --------------------------------------------------------------------------
 step "Bước 10: Dọn dẹp"
