@@ -5,15 +5,15 @@
 # tự tìm root, mount /boot và /boot/efi theo fstab của VM, bind /dev /proc /sys /run,
 # chroot vào chạy lệnh, xong tự umount.
 #
-#     sudo bash vm-chroot.sh --dracut               # tạo lại initramfs MỌI kernel, kèm virtio
-#     sudo bash vm-chroot.sh                        # mở shell root trong VM (gõ exit để thoát)
+#     sudo bash vm-chroot.sh                        # MẶC ĐỊNH: tạo lại initramfs mọi kernel, kèm virtio
+#     sudo bash vm-chroot.sh --shell                # mở shell root trong VM (gõ exit để thoát)
 #     sudo bash vm-chroot.sh -- <lệnh> [tham số]    # chạy một lệnh bất kỳ trong VM
 #
 # Tùy chọn:
 #     --root /dev/mapper/centos-root   chỉ định root, bỏ qua bước tự dò
 #
-# --dracut dùng cho VM họ RHEL (CentOS, Rocky, Alma...) boot được bằng kernel rescue nhưng
-# kernel thường treo "dracut-initqueue timeout" vì initramfs tạo trên Hyper-V/VMware thiếu virtio.
+# Chế độ mặc định dùng cho VM họ RHEL (CentOS, Rocky, Alma...) boot được bằng kernel rescue
+# nhưng kernel thường treo "dracut-initqueue timeout" vì initramfs tạo trên Hyper-V/VMware thiếu virtio.
 # ==========================================================================
 # Script dùng cú pháp bash; nếu bị gọi bằng "sh vm-chroot.sh" (dash) thì tự chạy lại bằng bash
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -49,10 +49,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-ROOT_DEV=""; MODE=shell; CMD=()
+ROOT_DEV=""; MODE=dracut; CMD=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --dracut) MODE=dracut ;;
+        --shell)  MODE=shell ;;
         --root)   shift; ROOT_DEV="${1:-}" ;;
         --)       shift; MODE=cmd; CMD=("$@"); break ;;
         *)        die "Tham số không hợp lệ: $1 (xem đầu file vm-chroot.sh)" ;;
