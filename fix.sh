@@ -327,7 +327,8 @@ report_os() {
     done
     for f in "$PROBE"/etc/sysconfig/network-scripts/ifcfg-*; do
         [ -f "$f" ] || continue
-        case "$f" in */ifcfg-lo) continue ;; esac
+        # network-scripts bỏ qua file sao lưu, không tính là cấu hình
+        case "$f" in */ifcfg-lo|*.bak|*.orig|*.rpmnew|*.rpmorig|*.rpmsave|*~) continue ;; esac
         nets=1
         dev_=$(osr_get "$f" DEVICE); proto=$(osr_get "$f" BOOTPROTO)
         ip=$(osr_get "$f" IPADDR); hw=$(osr_get "$f" HWADDR)
