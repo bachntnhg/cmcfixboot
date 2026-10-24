@@ -1,23 +1,24 @@
 #!/bin/bash
 # ==========================================================================
-# convert-centos7.sh  (v1)
-# Sửa VM CentOS 7 tạo trên Hyper-V Gen 1 (Legacy BIOS + MBR) để boot được trên
-# OpenStack khi instance bắt buộc chạy firmware UEFI (rơi vào "UEFI Interactive
-# Shell") và không đổi được hw_firmware_type.
+# convert-centos7.sh  (v2)
+# Sửa VM CentOS 7 (từ Hyper-V/VMware...) để boot được trên OpenStack, cả khi instance
+# chạy UEFI (rơi vào "UEFI Interactive Shell") lẫn BIOS/SeaBIOS ("No bootable device").
 #
-# Cách làm (KHÔNG thu nhỏ phân vùng nào, không chuyển GPT):
+# Chế độ BIOS (fstab không có /boot/efi, ví dụ Hyper-V Gen 1, đĩa MBR):
+#   KHÔNG thu nhỏ phân vùng nào, không chuyển GPT:
 #   - Chép nội dung phân vùng /boot riêng (thường vda1, XFS 1 GiB) vào /boot
 #     trên filesystem root (LVM centos-root), kiểm tra bản chép
 #   - Format phân vùng /boot cũ thành ESP FAT32, đổi type MBR sang 0xEF
 #     (UEFI đọc được ESP trên đĩa MBR)
 #   - Cài grub2-efi + shim từ vault.centos.org, tạo grub.cfg cho UEFI,
 #     đặt bản --removable EFI/BOOT/BOOTX64.EFI (không phụ thuộc NVRAM)
+# Chế độ UEFI (fstab đã có /boot/efi, ví dụ Hyper-V Gen 2, VMware EFI):
+#   giữ nguyên phân vùng, đặt EFI/BOOT/BOOTX64.EFI, tạo lại grub.cfg
+#   (chỉ tải gói nếu ESP thiếu file).
+# Cả hai chế độ:
+#   - Cài thêm GRUB BIOS (grub2-pc) để boot được cả SeaBIOS; đĩa GPT thì tạo
+#     phân vùng bios_grub ở sector 34-2047 (cần phân vùng đầu bắt đầu từ 2048)
 #   - Thêm driver virtio vào initramfs, sửa mạng (ifcfg), bật SELinux relabel
-# Sau khi chạy, VM CHỈ boot được UEFI.
-#
-# Nếu fstab đã có /boot/efi (VM cài kiểu UEFI: Hyper-V Gen 2, VMware EFI...), script
-# chạy chế độ "chỉ sửa cấu hình": giữ nguyên phân vùng, đặt EFI/BOOT/BOOTX64.EFI,
-# tạo lại grub.cfg, virtio, mạng, SELinux relabel (chỉ tải gói nếu ESP thiếu file).
 #
 # Chạy trong Ubuntu Live (có mạng), bằng quyền root:
 #
@@ -39,6 +40,7 @@ MNT=/mnt
 PROBE=/tmp/probe-root
 VAULT=http://vault.centos.org
 ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+BIOSBOOT_GUID="21686148-6449-6e6f-744e-656564454649"
 
 R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'
 info() { echo "${G}[+]${N} $*"; }
@@ -55,7 +57,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-part_num() { cat "/sys/class/block/$(basename "$1")/partition" 2>/dev/null; }
+part_num()   { cat "/sys/class/block/$(basename "$1")/partition" 2>/dev/null; }
+part_start() { cat "/sys/class/block/$(basename "$1")/start" 2>/dev/null; }
 # Thiết bị theo cột 1 của fstab (UUID=, LABEL= hoặc /dev/...)
 spec_dev() { case "$1" in /dev/*) echo "$1" ;; *) findfs "$1" 2>/dev/null ;; esac; }
 
@@ -65,9 +68,11 @@ step "Bước 0: Kiểm tra ban đầu"
 [ -b "$DISK" ] || die "Không tìm thấy ổ đĩa $DISK (dùng: sudo bash $0 /dev/xxx)"
 
 if [ -d /sys/firmware/efi ]; then
-    info "Live CD đang boot ở chế độ UEFI."
+    FW=uefi
+    info "Instance đang boot UEFI."
 else
-    warn "Live CD đang boot ở chế độ BIOS. Vẫn chạy được, nhưng sau khi sửa VM CHỈ boot được UEFI."
+    FW=bios
+    warn "Instance đang boot BIOS (SeaBIOS): bắt buộc phải cài được GRUB BIOS thì VM mới boot."
 fi
 
 if lsblk -nrpo MOUNTPOINT "$DISK" | grep -q .; then
@@ -88,6 +93,7 @@ command -v mkfs.vfat >/dev/null || need_pkgs+=(dosfstools)
 command -v vgchange  >/dev/null || need_pkgs+=(lvm2)
 command -v sfdisk    >/dev/null || need_pkgs+=(fdisk)
 command -v diff      >/dev/null || need_pkgs+=(diffutils)
+command -v sgdisk    >/dev/null || need_pkgs+=(gdisk)
 if [ "${#need_pkgs[@]}" -gt 0 ]; then
     info "Cài: ${need_pkgs[*]}"
     apt-get update -qq
@@ -192,6 +198,34 @@ else
     [ "$ROOT_FREE" -ge $((BOOT_USED + 512)) ] || die "Root không đủ chỗ để chứa /boot (cần ~$((BOOT_USED + 512)) MiB)."
 fi
 
+# GRUB BIOS: cài thêm để VM boot được cả khi instance chạy SeaBIOS
+BIOS_DISK=""; CREATE_BIOSGRUB=0; BIOS_NOTE=""
+FIRST_START=$(lsblk -nrpo PATH,TYPE "$DISK" | awk '$2=="part" {print $1}' \
+    | while read -r p; do part_start "$p"; done | sort -n | head -n1)
+if [ -z "$FIRST_START" ] || [ "$FIRST_START" -lt 2048 ]; then
+    BIOS_NOTE="phân vùng đầu bắt đầu ở sector ${FIRST_START:-?} (< 2048), không có chỗ cho GRUB BIOS"
+elif [ "$PT" = "gpt" ]; then
+    BIOS_DISK="$DISK"
+    CREATE_BIOSGRUB=1
+    for p in $(lsblk -nrpo PATH,TYPE "$DISK" | awk '$2=="part" {print $1}'); do
+        t=$(blkid -p -s PART_ENTRY_TYPE -o value "$p" 2>/dev/null | tr 'A-F' 'a-f')
+        [ "$t" = "$BIOSBOOT_GUID" ] && CREATE_BIOSGRUB=0
+    done
+else
+    # MBR: GRUB nằm trong khoảng trống giữa MBR và phân vùng đầu
+    BIOS_DISK="$DISK"
+fi
+if [ -n "$BIOS_DISK" ]; then
+    info "GRUB BIOS: sẽ cài lên $BIOS_DISK$([ "$CREATE_BIOSGRUB" = 1 ] && echo " (tạo phân vùng bios_grub ở sector 34-2047)")"
+elif [ "$FW" = "bios" ]; then
+    die "Instance boot BIOS nhưng $BIOS_NOTE. VM sẽ không boot được nên script dừng. Chưa có thay đổi nào trên đĩa."
+else
+    warn "Không cài được GRUB BIOS: $BIOS_NOTE. VM chỉ boot được UEFI."
+fi
+# Từ 7.5 module BIOS nằm trong grub2-pc-modules; thư mục này có nghĩa là đã đủ gói
+NEED_BIOS_PKG=0
+[ -n "$BIOS_DISK" ] && [ ! -d "$MNT/usr/lib/grub/i386-pc" ] && NEED_BIOS_PKG=1
+
 # Mạng: ifcfg của Hyper-V thường gắn HWADDR cũ; IP tĩnh cũ không khớp port Neutron
 NS="$MNT/etc/sysconfig/network-scripts"
 echo
@@ -232,6 +266,9 @@ else
     echo "  4. Cài grub2-efi + shim từ $VAULT/$VER, tạo grub.cfg UEFI"
     echo "  5. initramfs có virtio, mạng: $NET_PLAN, SELinux relabel"
 fi
+if [ -n "$BIOS_DISK" ]; then
+    echo "  +. Cài GRUB BIOS (grub2-pc) lên $BIOS_DISK$([ "$CREATE_BIOSGRUB" = 1 ] && echo ", tạo bios_grub"): boot được cả SeaBIOS lẫn UEFI"
+fi
 echo "${Y}Thao tác này GHI lên đĩa. Hãy chắc chắn đã snapshot/backup volume trước.${N}"
 read -rp "Gõ YES (viết hoa) để tiếp tục: " ans
 [ "$ans" = "YES" ] || die "Đã hủy. Chưa có thay đổi nào trên đĩa."
@@ -254,7 +291,9 @@ cat > "$MNT/root/c7-efi-chroot.sh" <<'CHROOT_EOF'
 set -e
 PHASE="$1"
 VER="$2"
+# download: $3=NEED_EFI $4=NEED_BIOS;  configure: $3=FIX_NET $4=BIOS_DISK
 FIX_NET="${3:-0}"
+BIOS_DISK="${4:-}"
 VAULT=http://vault.centos.org
 RPMS=/root/efi-rpms
 EFIDIR=/boot/efi/EFI/centos
@@ -295,11 +334,20 @@ EOF
     echo "[chroot] Kiểm tra kết nối tới $VAULT/$VER"
     "${YUM[@]}" makecache || { echo "[chroot] LỖI: không đọc được repo vault."; exit 1; }
 
-    # Từ 7.5 gói đổi tên thành grub2-efi-x64 / shim-x64
-    if "${YUM[@]}" list grub2-efi-x64 >/dev/null 2>&1; then
-        PKGS="grub2-efi-x64 shim-x64 efibootmgr"
-    else
-        PKGS="grub2-efi shim efibootmgr"
+    NEED_EFI="${3:-1}"; NEED_BIOS="${4:-0}"
+    PKGS=""
+    if [ "$NEED_EFI" = "1" ]; then
+        # Từ 7.5 gói đổi tên thành grub2-efi-x64 / shim-x64
+        if "${YUM[@]}" list grub2-efi-x64 >/dev/null 2>&1; then
+            PKGS="grub2-efi-x64 shim-x64 efibootmgr"
+        else
+            PKGS="grub2-efi shim efibootmgr"
+        fi
+    fi
+    if [ "$NEED_BIOS" = "1" ]; then
+        PKGS="$PKGS grub2-pc"
+        # Từ 7.5 module BIOS tách sang grub2-pc-modules
+        "${YUM[@]}" list grub2-pc-modules >/dev/null 2>&1 && PKGS="$PKGS grub2-pc-modules"
     fi
     echo "[chroot] Gói cần cài: $PKGS"
     rm -rf "$RPMS"; mkdir -p "$RPMS"
@@ -426,6 +474,21 @@ fi
 echo "[chroot] Tham số root trong grub.cfg:"
 grep -o 'root=[^ ]*' "$EFIDIR/grub.cfg" | sort -u | head -3
 
+if [ -n "$BIOS_DISK" ]; then
+    echo "[chroot] Cài GRUB BIOS lên $BIOS_DISK (boot được cả SeaBIOS)"
+    grub2-install --target=i386-pc "$BIOS_DISK"
+    mkdir -p /boot/grub2
+    # Trên máy cài UEFI, file này có thể là link sang grub.cfg của ESP: không ghi đè qua link
+    [ -L /boot/grub2/grub.cfg ] && rm -f /boot/grub2/grub.cfg
+    grub2-mkconfig -o /boot/grub2/grub.cfg
+    # grub.cfg cho BIOS phải dùng linux16/initrd16 (mkconfig dùng linuxefi nếu live CD boot UEFI)
+    sed -i -E 's/^([[:space:]]*)linuxefi[[:space:]]/\1linux16 /; s/^([[:space:]]*)initrdefi[[:space:]]/\1initrd16 /' /boot/grub2/grub.cfg
+    if ! grep -q 'linux16.*vmlinuz' /boot/grub2/grub.cfg; then
+        echo "[chroot] LỖI: /boot/grub2/grub.cfg không có entry linux16 nào."; exit 1
+    fi
+    [ -e /etc/grub2.cfg ] || ln -sf ../boot/grub2/grub.cfg /etc/grub2.cfg
+fi
+
 echo "[chroot] Tắt dịch vụ Hyper-V (nếu có)"
 for svc in hypervkvpd.service hypervvssd.service hypervfcopyd.service; do
     systemctl disable "$svc" >/dev/null 2>&1 && echo "  disable $svc" || true
@@ -448,20 +511,31 @@ rm -rf "$RPMS"
 CHROOT_EOF
 chmod +x "$MNT/root/c7-efi-chroot.sh"
 
-NEED_DL=1
+NEED_EFI=1
 if [ "$MODE" = "uefi" ]; then
-    # Chỉ tải gói khi ESP thiếu file bootloader của CentOS
+    # Chỉ tải gói UEFI khi ESP thiếu file bootloader của CentOS
     if [ -f "$MNT/boot/efi/EFI/centos/grubx64.efi" ] \
        && { [ -f "$MNT/boot/efi/EFI/centos/shimx64.efi" ] || [ -f "$MNT/boot/efi/EFI/centos/shim.efi" ]; }; then
-        NEED_DL=0
+        NEED_EFI=0
     fi
 fi
-if [ "$NEED_DL" = "1" ]; then
-    chroot "$MNT" /bin/bash /root/c7-efi-chroot.sh download "$VER" \
-        || die "Không tải được gói GRUB UEFI từ vault. Đĩa chưa bị đổi (chỉ thêm file repo và /root/efi-rpms)."
+if [ "$NEED_EFI" = "1" ] || [ "$NEED_BIOS_PKG" = "1" ]; then
+    chroot "$MNT" /bin/bash /root/c7-efi-chroot.sh download "$VER" "$NEED_EFI" "$NEED_BIOS_PKG" \
+        || die "Không tải được gói GRUB từ vault. Đĩa chưa bị đổi (chỉ thêm file repo và /root/efi-rpms)."
 else
     rm -rf "$MNT/root/efi-rpms"
-    info "ESP đã có grubx64.efi và shim, không cần tải gói."
+    info "Đã đủ gói GRUB UEFI/BIOS, không cần tải."
+fi
+
+if [ "$CREATE_BIOSGRUB" = "1" ]; then
+    # ----------------------------------------------------------------------
+    step "Bước 5b: Tạo phân vùng bios_grub (sector 34-2047)"
+    # Đĩa đang bận nên không tin mã thoát của sgdisk, kiểm tra bằng cách đọc lại bảng phân vùng
+    sgdisk -a 1 -n 0:34:2047 -t 0:ef02 -c 0:"BIOS boot" "$DISK" >/dev/null 2>&1
+    sgdisk -p "$DISK" 2>/dev/null | awk '$2==34 && toupper($6)=="EF02" {f=1} END {exit !f}' \
+        || die "Không tạo được phân vùng bios_grub. Đĩa chưa bị đổi gì khác."
+    partprobe "$DISK" 2>/dev/null; udevadm settle
+    info "Đã tạo bios_grub ở sector 34-2047"
 fi
 
 if [ "$MODE" = "bios" ]; then
@@ -512,7 +586,7 @@ fi
 
 # --------------------------------------------------------------------------
 step "Bước 8: Cấu hình trong chroot (GRUB UEFI, virtio, mạng)"
-chroot "$MNT" /bin/bash /root/c7-efi-chroot.sh configure "$VER" "$FIX_NET"
+chroot "$MNT" /bin/bash /root/c7-efi-chroot.sh configure "$VER" "$FIX_NET" "$BIOS_DISK"
 rc=$?
 rm -f "$MNT/root/c7-efi-chroot.sh"
 if [ "$rc" -ne 0 ]; then
@@ -531,11 +605,15 @@ sync
 echo
 echo "${G}${B}HOÀN TẤT.${N}"
 echo "Việc còn lại:"
-echo "  1. Tháo ISO / thoát rescue mode, rồi reboot (VM boot UEFI)."
+if [ -n "$BIOS_DISK" ]; then
+    echo "  1. Tháo ISO / thoát rescue mode, rồi reboot. Đĩa boot được cả BIOS (SeaBIOS) lẫn UEFI."
+else
+    echo "  1. Tháo ISO / thoát rescue mode, rồi reboot. Đĩa CHỈ boot được UEFI."
+fi
 echo "  2. Lần boot đầu SELinux relabel toàn bộ, máy tự reboot thêm 1 lần, có thể mất vài phút."
 echo "  3. Sau khi boot, kiểm tra:"
 echo "       [ -d /sys/firmware/efi ] && echo UEFI || echo BIOS"
 echo "       lsblk -f; ip a"
 if [ "$MODE" = "bios" ]; then
-    echo "  Lưu ý: VM giờ CHỈ boot được UEFI. /boot nằm trên root, fstab cũ ở /etc/fstab.bak.*"
+    echo "  Lưu ý: /boot giờ nằm trên root, fstab cũ ở /etc/fstab.bak.*"
 fi
