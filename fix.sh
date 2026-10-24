@@ -106,17 +106,25 @@ info "Đĩa: $DISK"
 step "Bước 2: Nhận diện hệ điều hành (chỉ đọc)"
 mkdir -p "$PROBE"
 found_dev=(); found_os=()
-while read -r dev fs; do
-    case "$fs" in ext2|ext3|ext4|xfs|btrfs) ;; *) continue ;; esac
-    mount -o ro "$dev" "$PROBE" 2>/dev/null \
-        || mount -o ro,norecovery "$dev" "$PROBE" 2>/dev/null \
-        || continue
+# Không dựa vào cột FSTYPE của lsblk (lấy từ udev, trên live CD có thể trống): đọc thẳng
+# bằng blkid -p, không nhận ra thì vẫn thử mount ro
+while read -r dev; do
+    fs=$(blkid -p -s TYPE -o value "$dev" 2>/dev/null)
+    case "$fs" in swap|LVM2_member|crypto_LUKS|linux_raid_member|vfat) continue ;; esac
+    if ! { mount -o ro "$dev" "$PROBE" 2>/dev/null \
+           || mount -o ro,norecovery "$dev" "$PROBE" 2>/dev/null; }; then
+        echo "  $dev (${fs:-không rõ fs}): không mount được, bỏ qua"
+        continue
+    fi
+    fs=$(findmnt -nro FSTYPE "$PROBE")
     if [ -f "$PROBE/etc/fstab" ] && os=$(detect_os "$PROBE"); then
         found_dev+=("$dev"); found_os+=("$os")
         echo "  $dev ($fs): ${os##*|}"
+    else
+        echo "  $dev ($fs): không phải root"
     fi
     umount "$PROBE"
-done < <(lsblk -nrpo PATH,FSTYPE "$DISK")
+done < <(lsblk -nrpo PATH,TYPE "$DISK" | awk '$2=="part" || $2=="lvm" {print $1}')
 
 if   [ "${#found_dev[@]}" -eq 0 ]; then
     die "Không tìm thấy hệ điều hành Linux nào trên $DISK."

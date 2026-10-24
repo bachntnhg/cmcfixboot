@@ -254,6 +254,8 @@ if [ -z "$ROOT_DEV" ]; then
     mkdir -p "$PROBE"
     cands=()
     while read -r dev fs; do
+        # FSTYPE của lsblk lấy từ udev, có thể trống trên live CD
+        [ -n "$fs" ] || fs=$(blkid -p -s TYPE -o value "$dev" 2>/dev/null)
         case "$fs" in ext2|ext3|ext4|xfs|btrfs) ;; *) continue ;; esac
         if mount -o ro "$dev" "$PROBE" 2>/dev/null; then
             if [ -f "$PROBE/etc/fstab" ] && [ -f "$PROBE/etc/os-release" ]; then

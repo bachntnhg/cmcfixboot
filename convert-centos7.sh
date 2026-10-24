@@ -109,6 +109,8 @@ mkdir -p "$PROBE"
 if [ -z "$ROOT_DEV" ]; then
     cands=()
     while read -r dev fs; do
+        # FSTYPE của lsblk lấy từ udev, có thể trống trên live CD
+        [ -n "$fs" ] || fs=$(blkid -p -s TYPE -o value "$dev" 2>/dev/null)
         case "$fs" in ext2|ext3|ext4|xfs) ;; *) continue ;; esac
         if mount -o ro "$dev" "$PROBE" 2>/dev/null; then
             if [ -f "$PROBE/etc/fstab" ] && [ -f "$PROBE/etc/centos-release" ]; then
@@ -144,7 +146,7 @@ VER=$(grep -oE '7\.[0-9]+\.[0-9]+' "$MNT/etc/centos-release" | head -n1)
 [ -n "$VER" ] || die "Script chỉ hỗ trợ CentOS 7, hệ thống là: $REL"
 info "Hệ điều hành: $REL (vault: $VAULT/$VER)"
 
-ROOT_FS=$(blkid -s TYPE -o value "$ROOT_DEV")
+ROOT_FS=$(blkid -p -s TYPE -o value "$ROOT_DEV")
 case "$ROOT_FS" in
     xfs|ext2|ext3|ext4) ;;
     *) die "Root là '$ROOT_FS', GRUB có thể không đọc được /boot trên đó. Dừng." ;;
