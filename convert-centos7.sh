@@ -358,16 +358,26 @@ else
     echo "GRUB_CMDLINE_LINUX=\"$NEW\"" >> /etc/default/grub
 fi
 
-echo "[chroot] Thêm driver virtio vào initramfs"
+echo "[chroot] Driver virtio trong initramfs"
+VIRTIO_MODS="virtio_blk virtio_scsi virtio_pci virtio_net"
+# Kernel cài sau này tự có virtio
 mkdir -p /etc/dracut.conf.d
-echo 'add_drivers+=" virtio_blk virtio_scsi virtio_pci virtio_net "' > /etc/dracut.conf.d/90-virtio.conf
-for d in /lib/modules/*; do
-    v=${d##*/}
-    [ -f "/boot/vmlinuz-$v" ] || continue
-    echo "  dracut $v (initramfs đầy đủ driver, có thể mất vài phút)"
-    # -N: initramfs đầy đủ driver, không phụ thuộc phần cứng lúc tạo (đang ở live CD)
-    dracut -f -N "/boot/initramfs-$v.img" "$v"
-done
+echo "add_drivers+=\" $VIRTIO_MODS \"" > /etc/dracut.conf.d/90-virtio.conf
+# Chỉ xử lý kernel mới nhất (entry mặc định của grub.cfg mới); kernel cũ vẫn boot bằng initramfs cũ
+KVER=$(for d in /lib/modules/*; do v=${d##*/}; [ -f "/boot/vmlinuz-$v" ] && echo "$v"; done \
+    | grep -v rescue | sort -V | tail -n1)
+if [ -z "$KVER" ]; then
+    echo "[chroot] LỖI: không tìm thấy kernel nào trong /boot"; exit 1
+fi
+if lsinitrd "/boot/initramfs-$KVER.img" 2>/dev/null | grep -q 'virtio_blk'; then
+    echo "  $KVER: initramfs đã có virtio_blk, bỏ qua"
+else
+    # initramfs tạo trên Hyper-V (hostonly) chỉ có hv_storvsc, thiếu virtio_blk thì không thấy đĩa trên KVM
+    echo "  $KVER: thêm $VIRTIO_MODS"
+    dracut -f --add-drivers "$VIRTIO_MODS" "/boot/initramfs-$KVER.img" "$KVER"
+    lsinitrd "/boot/initramfs-$KVER.img" | grep -q 'virtio_blk' \
+        || { echo "[chroot] LỖI: initramfs $KVER vẫn thiếu virtio_blk"; exit 1; }
+fi
 
 echo "[chroot] Tạo grub.cfg UEFI"
 grub2-mkconfig -o "$EFIDIR/grub.cfg"
