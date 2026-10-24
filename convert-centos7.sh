@@ -23,6 +23,11 @@
 # Biến môi trường tùy chọn:
 #     ROOT_DEV=/dev/mapper/centos-root   bỏ qua bước tự dò phân vùng root
 # ==========================================================================
+# Script dùng cú pháp bash; nếu bị gọi bằng "sh convert-centos7.sh" (dash) thì tự chạy lại bằng bash
+if [ -z "${BASH_VERSION:-}" ]; then
+    [ -f "$0" ] && exec bash "$0" "$@"
+    echo "Script cần bash, hãy chạy: sudo bash convert-centos7.sh" >&2; exit 1
+fi
 set -u
 
 DISK="${1:-/dev/vda}"

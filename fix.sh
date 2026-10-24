@@ -14,6 +14,11 @@
 # Biến môi trường tùy chọn:
 #     BRANCH=test-centos7   nhánh GitHub để tải script con (mặc định main)
 # ==========================================================================
+# Script dùng cú pháp bash; nếu bị gọi bằng "sh fix.sh" (dash) thì tự chạy lại bằng bash
+if [ -z "${BASH_VERSION:-}" ]; then
+    [ -f "$0" ] && exec bash "$0" "$@"
+    echo "Script cần bash, hãy chạy: sudo bash fix.sh" >&2; exit 1
+fi
 set -u
 
 REPO_RAW=https://raw.githubusercontent.com/bachntnhg/cmcfixboot
