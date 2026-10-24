@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================================================
-# convert.sh  (v7)
+# convert.sh  (v8)
 # Sửa VM Ubuntu/Debian restore (Acronis, từ Azure/VMware/vật lý...) để boot
 # trên KVM/OpenStack:
 #   - Chuyển MBR sang GPT, tạo ESP + bios_grub
@@ -273,6 +273,18 @@ fi
 [ -b "$ROOT_DEV" ] || die "$ROOT_DEV không phải block device."
 info "Phân vùng root: $ROOT_DEV"
 
+# Chỉ hỗ trợ Ubuntu/Debian (apt, netplan, update-initramfs). Kiểm tra trước khi ghi đĩa.
+mkdir -p "$PROBE"
+mount -o ro "$ROOT_DEV" "$PROBE" || die "Không mount được $ROOT_DEV để kiểm tra hệ điều hành."
+OS_REL="$PROBE/etc/os-release"
+case "$(readlink "$OS_REL" 2>/dev/null)" in /*) OS_REL="$PROBE/usr/lib/os-release" ;; esac
+OS_ID=$(grep -E '^(ID|ID_LIKE)=' "$OS_REL" 2>/dev/null | cut -d= -f2 | tr -d '"' | xargs)
+umount "$PROBE"
+case " $OS_ID " in
+    *" ubuntu "*|*" debian "*) info "Hệ điều hành: $OS_ID" ;;
+    *) die "Hệ điều hành trên $ROOT_DEV là '${OS_ID:-không xác định}'. Script chỉ hỗ trợ Ubuntu/Debian. Chưa có thay đổi nào trên đĩa." ;;
+esac
+
 # --------------------------------------------------------------------------
 step "Bước 4: Kiểm tra chỗ trống, thu nhỏ nếu cần"
 if [ "$PT" = "gpt" ]; then
@@ -408,7 +420,14 @@ if cat "$MNT"/etc/netplan/*.yaml 2>/dev/null | grep -Eq 'hv_netvsc|macaddress:|s
     warn "Trên KVM card mạng là virtio với MAC mới nên sẽ KHÔNG có mạng. Khuyên chọn Y."
     NET_DEFAULT=Y
 fi
-if cat "$MNT"/etc/netplan/*.yaml 2>/dev/null | grep -Eq '^[[:space:]]*addresses:'; then
+# Chỉ tính addresses: của card mạng, bỏ qua addresses: nằm trong khối nameservers:
+if cat "$MNT"/etc/netplan/*.yaml 2>/dev/null | awk '
+    /^[[:space:]]*(#|$)/ {next}
+    { match($0, /^[[:space:]]*/); ind = RLENGTH }
+    ns && ind <= nsind {ns = 0}
+    /^[[:space:]]*nameservers:/ {ns = 1; nsind = ind; next}
+    !ns && /^[[:space:]]*addresses:/ {found = 1}
+    END {exit !found}'; then
     warn "Netplan có IP tĩnh (addresses:). Nếu chọn Y, máy sẽ chuyển sang DHCP."
     NET_DEFAULT=N
 fi
@@ -522,27 +541,36 @@ mkdir -p /etc/default/grub.d
 # PARTUUID đã đổi khi chuyển MBR -> GPT: bỏ ép root theo PARTUUID cũ
 rm -f /etc/default/grub.d/40-force-partuuid.cfg
 sed -i -E 's/^(GRUB_FORCE_PARTUUID=)/#\1/' /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null || true
-# Lấy cmdline hiện có (bỏ qua file 99 của script nếu đã chạy trước đó)
-CUR_CMDLINE=$(
+# Đọc giá trị biến GRUB hiện có (bỏ qua file 99 của script nếu đã chạy trước đó): $1=tên biến
+read_grub_var() (
     set +e
-    GRUB_CMDLINE_LINUX_DEFAULT=""
+    eval "$1=''"
     [ -f /etc/default/grub ] && . /etc/default/grub >/dev/null 2>&1
     for f in /etc/default/grub.d/*.cfg; do
         [ "$f" = /etc/default/grub.d/99-cmc-cloud.cfg ] && continue
         [ -f "$f" ] && . "$f" >/dev/null 2>&1
     done
-    printf '%s' "$GRUB_CMDLINE_LINUX_DEFAULT"
+    printf '%s' "${!1}"
 )
-# Giữ nguyên mọi tham số cũ, chỉ bỏ các console= cũ rồi nối console mới vào cuối
-NEW_CMDLINE=$(
+# Giữ nguyên mọi tham số, chỉ bỏ các console=
+strip_console() (
     set -f
-    for t in $CUR_CMDLINE; do
-        case "$t" in console=*) ;; *) printf '%s ' "$t" ;; esac
+    out=""
+    for t in $1; do
+        case "$t" in console=*) ;; *) out="$out$t " ;; esac
     done
+    printf '%s' "${out% }"
 )
-NEW_CMDLINE="${NEW_CMDLINE}console=ttyS0,115200 console=tty1"
-echo "[chroot] Cmdline cũ : ${CUR_CMDLINE:-(trống)}"
-echo "[chroot] Cmdline mới: $NEW_CMDLINE"
+CUR_CMDLINE=$(read_grub_var GRUB_CMDLINE_LINUX_DEFAULT)
+CUR_LINUX=$(read_grub_var GRUB_CMDLINE_LINUX)
+# console mới chỉ nối vào cuối DEFAULT; console= cũ ở cả hai biến đều bị bỏ
+NEW_CMDLINE=$(strip_console "$CUR_CMDLINE")
+NEW_CMDLINE="${NEW_CMDLINE:+$NEW_CMDLINE }console=ttyS0,115200 console=tty1"
+NEW_LINUX=$(strip_console "$CUR_LINUX")
+echo "[chroot] GRUB_CMDLINE_LINUX_DEFAULT cũ : ${CUR_CMDLINE:-(trống)}"
+echo "[chroot] GRUB_CMDLINE_LINUX_DEFAULT mới: $NEW_CMDLINE"
+echo "[chroot] GRUB_CMDLINE_LINUX cũ : ${CUR_LINUX:-(trống)}"
+echo "[chroot] GRUB_CMDLINE_LINUX mới: ${NEW_LINUX:-(trống)}"
 # Hiện menu, đưa output ra cả màn hình VNC (tty1) và cổng serial
 {
     echo "# Tạo bởi convert.sh. Bản gốc: /root/grub-backup/"
@@ -551,13 +579,25 @@ echo "[chroot] Cmdline mới: $NEW_CMDLINE"
     echo "GRUB_RECORDFAIL_TIMEOUT=5"
     echo 'GRUB_TERMINAL="console serial"'
     echo "GRUB_CMDLINE_LINUX_DEFAULT=\"$NEW_CMDLINE\""
+    echo "GRUB_CMDLINE_LINUX=\"$NEW_LINUX\""
 } > /etc/default/grub.d/99-cmc-cloud.cfg
 
 echo "[chroot] Thêm driver virtio vào initramfs"
-for m in virtio_blk virtio_scsi virtio_net virtio_pci; do
-    grep -qx "$m" /etc/initramfs-tools/modules || echo "$m" >> /etc/initramfs-tools/modules
-done
-update-initramfs -u -k all
+VIRTIO_MODS="virtio_blk virtio_scsi virtio_net virtio_pci"
+# Ubuntu 25.10+ mặc định dùng dracut thay cho initramfs-tools
+if ! dpkg -s initramfs-tools >/dev/null 2>&1 && command -v dracut >/dev/null 2>&1; then
+    echo "[chroot] Hệ thống dùng dracut"
+    mkdir -p /etc/dracut.conf.d
+    echo "add_drivers+=\" $VIRTIO_MODS \"" > /etc/dracut.conf.d/90-cmc-virtio.conf
+    dracut --regenerate-all -f
+else
+    mkdir -p /etc/initramfs-tools
+    touch /etc/initramfs-tools/modules
+    for m in $VIRTIO_MODS; do
+        grep -qx "$m" /etc/initramfs-tools/modules || echo "$m" >> /etc/initramfs-tools/modules
+    done
+    update-initramfs -u -k all
+fi
 
 echo "[chroot] grub-install"
 # --no-nvram: luôn chép đủ file vào ESP, không phụ thuộc việc ghi biến EFI
@@ -671,7 +711,8 @@ echo "Việc còn lại:"
 echo "  1. Tháo ISO Ubuntu live khỏi instance."
 if [ -n "$BIOS_DISK" ]; then
     echo "  2. Reboot. Đĩa boot được cả Legacy BIOS (SeaBIOS) lẫn UEFI."
-    echo "     Sau mỗi lần nâng cấp gói GRUB, nên chạy: sudo grub-install --target=i386-pc $BIOS_DISK"
+    echo "     GRUB BIOS tự cài lại khi gói grub-pc-bin được nâng cấp (hook /etc/apt/apt.conf.d/99-grub-bios-reinstall)."
+    echo "     Xem log: journalctl -t grub-bios-reinstall"
 else
     echo "  2. Đĩa CHỈ boot được UEFI: VM phải chạy firmware UEFI (hw_firmware_type=uefi), rồi reboot."
 fi
