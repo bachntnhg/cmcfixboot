@@ -497,11 +497,27 @@ if [ ! -e /usr/sbin/policy-rc.d ]; then
     chmod 755 /usr/sbin/policy-rc.d
     POLICY_RC=1
 fi
+# Repo tạm (chỉ tạo khi VM không có repo chính), gỡ khi thoát để sources.list của VM như cũ
+TEMP_LIST=/etc/apt/sources.list.d/zz-cmc-temp-archive.list
 chroot_cleanup() {
     restore_dns
     if [ -n "$POLICY_RC" ]; then rm -f /usr/sbin/policy-rc.d; fi
+    if [ -f "$TEMP_LIST" ]; then
+        rm -f "$TEMP_LIST"
+        echo "[chroot] Đã gỡ repo tạm $TEMP_LIST"
+    fi
 }
 trap chroot_cleanup EXIT
+
+# Repo bên thứ ba (PPA đổi Label/Origin, repo chết...) làm apt-get update trả lỗi dù repo
+# chính vẫn cập nhật được: chấp nhận đổi thông tin release, lỗi còn lại thì vẫn đi tiếp
+# (apt-get install phía sau sẽ báo lỗi nếu thật sự thiếu gói)
+apt_update() {
+    if ! apt-get update --allow-releaseinfo-change && ! apt-get update; then
+        echo "[chroot] CẢNH BÁO: apt-get update có lỗi (thường do repo bên thứ ba), tiếp tục với các repo còn lại"
+    fi
+}
+has_grub_efi() { apt-cache policy grub-efi-amd64-signed 2>/dev/null | grep -Eq 'Candidate: [^(]'; }
 
 # apt-get install nhưng không dừng vì gói KHÁC lỗi cấu hình (ví dụ mysql-server cài dở từ
 # trước): chỉ báo lỗi khi chính các gói cần cài chưa vào trạng thái installed
@@ -551,11 +567,31 @@ echo "grub-efi-amd64 grub2/update_nvram boolean false" | debconf-set-selections
 
 echo "[chroot] Cài GRUB UEFI"
 dpkg --configure -a || true
-# Repo bên thứ ba (PPA đổi Label/Origin, repo chết...) làm apt-get update trả lỗi dù repo
-# chính vẫn cập nhật được: chấp nhận đổi thông tin release, lỗi còn lại thì vẫn đi tiếp
-# (apt-get install phía sau sẽ báo lỗi nếu thật sự thiếu gói)
-if ! apt-get update --allow-releaseinfo-change && ! apt-get update; then
-    echo "[chroot] CẢNH BÁO: apt-get update có lỗi (thường do repo bên thứ ba), tiếp tục với các repo còn lại"
+apt_update
+# Image cũ (Azure 18.04...) có thể không còn repo chính trong sources.list, chỉ còn PPA:
+# thêm tạm repo chính thức theo codename. Bản LTS còn ESM (18.04, 16.04) vẫn ở archive,
+# bản đã hết hạn hẳn nằm ở old-releases.
+if ! has_grub_efi; then
+    OS_ID=$(. /etc/os-release 2>/dev/null; echo "${ID:-}")
+    CODENAME=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}")
+    if [ "$OS_ID" = "ubuntu" ] && [ -n "$CODENAME" ]; then
+        for MIRROR in http://archive.ubuntu.com/ubuntu http://old-releases.ubuntu.com/ubuntu; do
+            echo "[chroot] Repo hiện có không có gói GRUB UEFI, thêm tạm repo $MIRROR ($CODENAME)"
+            cat > "$TEMP_LIST" <<EOF
+# Tạm thời, tạo bởi convert.sh, tự gỡ khi script kết thúc
+deb $MIRROR $CODENAME main restricted universe
+deb $MIRROR $CODENAME-updates main restricted universe
+deb $MIRROR $CODENAME-security main restricted universe
+EOF
+            apt_update
+            has_grub_efi && break
+        done
+    fi
+    if ! has_grub_efi; then
+        echo "[chroot] LỖI: không tìm được repo nào có grub-efi-amd64-signed cho ${OS_ID:-?} ${CODENAME:-?}."
+        echo "[chroot] Kiểm tra /etc/apt/sources.list và mạng của live CD."
+        exit 1
+    fi
 fi
 apt_install grub-efi-amd64 grub-efi-amd64-signed shim-signed efibootmgr
 
